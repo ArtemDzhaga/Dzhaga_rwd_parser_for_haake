@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.matplotlib-cache/
+.cache/
+~$*.xlsx
+input/.DS_Store
+input/**/.DS_Store
+output/.DS_Store
+output/plots/
+output/plots_check/
+output/plots_*_check/
+output/*_check.xlsx
+output/ux_*.xlsx
+output/parser_timer_check.xlsx
