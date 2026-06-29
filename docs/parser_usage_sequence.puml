@@ -1,0 +1,55 @@
+@startuml
+title HAAKE RheoWin parser: общий пользовательский процесс
+
+actor "Пользователь" as User
+participant "Терминал" as Terminal
+participant "haake_cli.py" as ParserCli
+participant "Excel-шаблон .xlsx" as Template
+participant "ASCII-структура RheoWin" as Ascii
+participant ".rwd файлы / папка" as Rwd
+participant "Excel-отчет .xlsx" as Workbook
+participant "haake_plot.py" as PlotCli
+participant "PNG-графики" as Plots
+
+User -> Terminal: Запускает команду парсера
+Terminal -> ParserCli: template, ascii, rwd/folder,\n--recursive, --sheet, -o
+
+ParserCli -> Template: Открыть книгу-шаблон
+ParserCli -> Ascii: Прочитать заголовки,\nчастоты и длину сегмента
+ParserCli -> Rwd: Найти и прочитать .rwd
+
+loop Для каждого .rwd
+  ParserCli -> ParserCli: Разобрать имя эксперимента\nсостав, U, freq
+  ParserCli -> ParserCli: Сопоставить бинарные каналы\nс ASCII-структурой
+  ParserCli -> ParserCli: Найти фактические частотные\nсегменты по f in Hz
+  ParserCli -> ParserCli: Округлить измерения как RheoWin\nдо 4 значащих цифр
+  ParserCli -> Workbook: Записать точки в input_data
+end
+
+ParserCli -> Workbook: Обновить output_data формулами шаблона
+ParserCli -> ParserCli: Проверить input_data\nна повторяющиеся блоки
+
+alt Дубли найдены
+  ParserCli --> Terminal: Остановить импорт и вывести\nсписок повторов
+else Дублей нет
+  ParserCli -> Workbook: Сохранить итоговую книгу
+  ParserCli --> Terminal: Показать отчет и время выполнения
+end
+
+User -> Terminal: Запускает команду графиков
+Terminal -> PlotCli: workbook, --sheet output_data,\n-o plots, --points, --poly-order
+
+PlotCli -> Workbook: Прочитать output_data
+PlotCli -> PlotCli: Проверить серии на повторы
+
+alt Дубли найдены
+  PlotCli --> Terminal: Остановить построение и вывести\nсписок повторов
+else Дублей нет
+  loop Для каждой частоты и метрики
+    PlotCli -> PlotCli: Построить логарифмический график\nи полиномиальную кривую
+    PlotCli -> Plots: Сохранить PNG/SVG/PDF
+  end
+  PlotCli --> Terminal: Показать папку графиков\nи время выполнения
+end
+
+@enduml

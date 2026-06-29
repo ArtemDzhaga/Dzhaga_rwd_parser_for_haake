@@ -194,6 +194,7 @@ def interactive_args() -> argparse.Namespace:
     raw_frequencies = prompt_line("8. Частоты через пробел, пусто = все", "")
     frequencies = [value.strip() for value in re.split(r"[\s,;]+", raw_frequencies) if value.strip()] or None
     no_fit = prompt_yes_no("Отключить полиномиальные кривые?", default=False)
+    legend_columns = prompt_int("Количество столбцов легенды", 1, 1)
     dpi = prompt_int("DPI для PNG", 300, 72)
     return argparse.Namespace(
         workbook=workbook,
@@ -206,7 +207,9 @@ def interactive_args() -> argparse.Namespace:
         metrics=metrics,
         frequencies=frequencies,
         dpi=dpi,
+        legend_columns=legend_columns,
         no_fit=no_fit,
+        allow_duplicates=False,
     )
 
 
@@ -262,9 +265,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--dpi", type=int, default=300, help="DPI для PNG.")
     parser.add_argument(
+        "--legend-columns",
+        type=int,
+        default=1,
+        help="Количество столбцов в легенде под графиком.",
+    )
+    parser.add_argument(
         "--no-fit",
         action="store_true",
         help="Не рисовать полиномиальную сглаживающую линию.",
+    )
+    parser.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help="Не останавливать построение, если на output_data найдены одинаковые серии.",
     )
     return parser.parse_args(argv)
 
@@ -486,47 +500,77 @@ def output_header_metric(value) -> str | None:
     return None
 
 
-def output_frequency_rows(ws) -> list[tuple[int, float, str]]:
-    rows: list[tuple[int, float, str]] = []
+def output_header_rows(ws) -> list[int]:
+    rows: list[int] = []
+    for row in range(1, ws.max_row + 1):
+        metrics = [
+            output_header_metric(ws.cell(row, column).value)
+            for column in range(1, ws.max_column + 1)
+        ]
+        if "gamma" in metrics and "g'" in metrics:
+            rows.append(row)
+    return rows
+
+
+def output_frequency_rows(ws) -> list[tuple[int, float, str, int]]:
+    header_rows = output_header_rows(ws)
+    rows: list[tuple[int, float, str, int]] = []
     for row in range(1, ws.max_row + 1):
         value = ws.cell(row, 1).value
         if not isinstance(value, str) or "частота" not in value.lower():
             continue
         frequency = parse_frequency_hz(value)
-        if frequency is not None:
-            rows.append((row, frequency, format_frequency_label(frequency)))
+        if frequency is None:
+            continue
+        header_row = max((candidate for candidate in header_rows if candidate < row), default=None)
+        if header_row is None:
+            continue
+        rows.append((row, frequency, format_frequency_label(frequency), header_row))
     return rows
 
 
-def output_metric_pairs(ws, metric: str) -> list[tuple[int, int, int, str]]:
+def output_metric_pairs(ws, metric: str, header_row: int = 1) -> list[tuple[int, int, int, str]]:
     pairs: list[tuple[int, int, int, str]] = []
+    label_row = header_row + 2
     if metric in OUTPUT_PAIR_METRICS:
         wanted_gamma = OUTPUT_PAIR_METRICS[metric]["gamma"]
         wanted_value = OUTPUT_PAIR_METRICS[metric]["value"]
         for column in range(1, ws.max_column):
-            left_metric = output_header_metric(ws.cell(1, column).value)
-            right_metric = output_header_metric(ws.cell(1, column + 1).value)
+            left_metric = output_header_metric(ws.cell(header_row, column).value)
+            right_metric = output_header_metric(ws.cell(header_row, column + 1).value)
             if left_metric != wanted_gamma or right_metric != wanted_value:
                 continue
-            voltage = header_voltage(ws.cell(1, column + 1).value)
-            label = ws.cell(3, column + 1).value or ws.cell(3, column).value
+            voltage = header_voltage(ws.cell(header_row, column + 1).value)
+            label = ws.cell(label_row, column + 1).value or ws.cell(label_row, column).value
             if voltage is not None:
                 pairs.append((voltage, column, column + 1, str(label or f"{voltage}v")))
         return pairs
 
     if metric == "tan_delta":
+        separator_columns = [
+            column
+            for column in range(1, ws.max_column + 1)
+            if str(ws.cell(header_row, column).value or "").strip("- ") == ""
+            and "----------" in str(ws.cell(header_row, column).value or "")
+        ]
+        last_separator = max(separator_columns, default=0)
+        summary_pairs: list[tuple[int, int, int, str]] = []
         for column in range(1, ws.max_column + 1):
-            if output_header_metric(ws.cell(1, column).value) != "tan_delta":
+            if output_header_metric(ws.cell(header_row, column).value) != "tan_delta":
                 continue
-            voltage = header_voltage(ws.cell(1, column).value)
-            label = ws.cell(3, column).value
+            voltage = header_voltage(ws.cell(header_row, column).value)
+            label = ws.cell(label_row, column).value
             if voltage is not None:
-                pairs.append((voltage, -1, column, str(label or f"{voltage}v")))
-        return pairs
+                item = (voltage, -1, column, str(label or f"{voltage}v"))
+                pairs.append(item)
+                if column > last_separator:
+                    summary_pairs.append(item)
+        return summary_pairs or pairs
     return pairs
 
 
 def read_output_data_series(workbook_path: Path, sheet_name: str, points: int) -> list[SeriesData]:
+    load_plot_dependencies()
     workbook = load_workbook(workbook_path, data_only=False, read_only=False)
     if sheet_name not in workbook.sheetnames:
         raise RuntimeError(
@@ -538,9 +582,15 @@ def read_output_data_series(workbook_path: Path, sheet_name: str, points: int) -
         raise RuntimeError(f"На листе {sheet_name!r} не найдены строки вида 'Частота ... Гц'.")
 
     by_key: dict[tuple[float, int, str], SeriesData] = {}
+    g_prime_pairs_by_header = {
+        header_row: output_metric_pairs(ws, "g_prime", header_row)
+        for header_row in {item[3] for item in frequency_rows}
+    }
+
     for metric in METRICS:
-        for voltage, gamma_column, value_column, label in output_metric_pairs(ws, metric):
-            for frequency_row, frequency, frequency_label in frequency_rows:
+        for frequency_row, frequency, frequency_label, header_row in frequency_rows:
+            metric_pairs = output_metric_pairs(ws, metric, header_row)
+            for voltage, gamma_column, value_column, label in metric_pairs:
                 rows = by_key.setdefault(
                     (frequency, voltage, label),
                     SeriesData(
@@ -560,8 +610,9 @@ def read_output_data_series(workbook_path: Path, sheet_name: str, points: int) -
                         gamma_column_for_voltage = next(
                             (
                                 pair_gamma_column
-                                for pair_voltage, pair_gamma_column, _, _ in output_metric_pairs(ws, "g_prime")
-                                if pair_voltage == voltage
+                                for pair_voltage, pair_gamma_column, _, pair_label
+                                in g_prime_pairs_by_header.get(header_row, [])
+                                if pair_voltage == voltage and pair_label == label
                             ),
                             None,
                         )
@@ -616,6 +667,7 @@ def read_output_data_series(workbook_path: Path, sheet_name: str, points: int) -
 
 
 def read_input_data_series(workbook_path: Path, sheet_name: str, points: int) -> list[SeriesData]:
+    load_plot_dependencies()
     workbook = load_workbook(workbook_path, data_only=True, read_only=True)
     if sheet_name not in workbook.sheetnames:
         raise RuntimeError(
@@ -698,6 +750,51 @@ def grouped_by_frequency(series: Iterable[SeriesData]) -> dict[float, list[Serie
     return groups
 
 
+def duplicate_value(value: float | None) -> float | None:
+    if value is None or not math.isfinite(float(value)):
+        return None
+    return round(float(value), 8)
+
+
+def series_duplicate_signature(item: SeriesData) -> tuple[tuple[float | None, ...], ...]:
+    return tuple(
+        (
+            duplicate_value(row.get("gamma")),
+            duplicate_value(row.get("g_prime")),
+            duplicate_value(row.get("g_double_prime")),
+            duplicate_value(row.get("eta")),
+            duplicate_value(row.get("tan_delta")),
+        )
+        for row in item.rows
+    )
+
+
+def duplicate_output_series(series: Iterable[SeriesData]) -> list[list[str]]:
+    groups: dict[tuple[tuple[float | None, ...], ...], list[str]] = {}
+    for item in series:
+        signature = series_duplicate_signature(item)
+        if len(signature) < 3:
+            continue
+        groups.setdefault(signature, []).append(
+            f"{item.frequency_label}: {item.label}"
+        )
+    return [items for items in groups.values() if len(items) > 1]
+
+
+def format_duplicate_series(groups: list[list[str]], limit: int = 8) -> str:
+    lines = [
+        "На output_data найдены повторяющиеся серии точек. "
+        "Графики остановлены, потому что одинаковые кривые искажают отчет."
+    ]
+    for index, group in enumerate(groups[:limit], start=1):
+        lines.append(f"Дубль {index}:")
+        lines.extend(f"  - {item}" for item in group)
+    if len(groups) > limit:
+        lines.append(f"... и еще {len(groups) - limit} групп дублей.")
+    lines.append("Исправьте парсинг/шаблон или запустите с --allow-duplicates.")
+    return "\n".join(lines)
+
+
 def selected_frequencies(values: list[str] | None) -> set[float] | None:
     if not values:
         return None
@@ -724,6 +821,7 @@ def plot_metric(
     poly_order: int,
     curve_points: int,
     draw_fit: bool,
+    legend_columns: int,
 ) -> list[Path]:
     metric_info = METRICS[metric]
     fig, ax = plt.subplots(figsize=(7.2, 8.6), dpi=dpi)
@@ -778,7 +876,7 @@ def plot_metric(
     legend = ax.legend(
         loc="upper center",
         bbox_to_anchor=(0.5, -0.2),
-        ncol=1,
+        ncol=legend_columns,
         frameon=True,
         fancybox=False,
         framealpha=1.0,
@@ -814,11 +912,16 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("--poly-order должен быть больше 0.")
     if args.curve_points < 20:
         raise RuntimeError("--curve-points должен быть не меньше 20.")
+    if args.legend_columns < 1:
+        raise RuntimeError("--legend-columns должен быть больше 0.")
     timer.mark("Валидация аргументов")
 
     load_plot_dependencies()
     timer.mark("Загрузка библиотек")
     series = read_series(args.workbook, args.sheet, args.points)
+    duplicate_groups = duplicate_output_series(series)
+    if duplicate_groups and not args.allow_duplicates:
+        raise RuntimeError(format_duplicate_series(duplicate_groups))
     timer.mark("Чтение данных Excel")
     frequency_filter = selected_frequencies(args.frequencies)
     groups = grouped_by_frequency(series)
@@ -838,6 +941,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.poly_order,
                     args.curve_points,
                     not args.no_fit,
+                    args.legend_columns,
                 )
             )
 
@@ -845,6 +949,8 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("Не построено ни одного графика: проверьте лист, частоты и данные.")
 
     print(f"Найдено серий данных: {len(series)}")
+    if duplicate_groups:
+        print(f"ВНИМАНИЕ: найдено групп повторяющихся серий: {len(duplicate_groups)}")
     print(f"Создано файлов графиков: {len(saved)}")
     print(f"Папка: {args.output_dir.resolve()}")
     timer.mark("Построение и сохранение графиков")

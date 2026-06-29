@@ -7,9 +7,17 @@ __pycache__/
 input/.DS_Store
 input/**/.DS_Store
 output/.DS_Store
+output/
+outputs/
 output/plots/
 output/plots_check/
 output/plots_*_check/
 output/*_check.xlsx
 output/ux_*.xlsx
 output/parser_timer_check.xlsx
+
+# Локальные экспериментальные наборы данных.
+input/06_june_proj/
+input/D_series/
+input/SCTNA_60_PyrO_40_Katal68_2/
+input/SCTNA_60_PyrO_40_Katal68_3/

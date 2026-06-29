@@ -22,6 +22,11 @@ haake_parser/
 │   ├── __init__.py
 │   ├── excel_import.py       # парсинг ASCII/.rwd, структурная карта, запись в Excel
 │   └── plot.py               # чтение Excel и построение matplotlib-графиков
+├── docs/
+│   └── parser_usage_sequence.puml
+├── input/
+│   └── D_series_report_template_first20_clean.xlsx
+├── output/
 ├── README.md
 ├── requirements.txt
 └── .gitignore
@@ -79,6 +84,16 @@ lock-файл вида `~$may_proj_v1_2.xlsx`, и перезапись того 
   - Итого: ...
 ```
 
+Перед сохранением скрипт проверяет лист `input_data` на повторяющиеся
+числовые блоки. Если один и тот же массив точек оказался записан в разные
+частоты или разные секции, импорт останавливается и показывает список дублей.
+Это защита от ситуации, когда один сегмент `.rwd` случайно раскладывается по
+нескольким частотам.
+
+Флаг `--allow-duplicates` есть только для диагностики. В обычной обработке его
+лучше не использовать: если дубли появились, нужно проверить исходные `.rwd`,
+ASCII-структуру или шаблон.
+
 ### 2. Построить графики
 
 Графики строятся отдельным Python-скриптом:
@@ -108,6 +123,11 @@ python3 haake_plot.py
   - Построение и сохранение графиков: ...
   - Итого: ...
 ```
+
+Перед построением графиков скрипт проверяет `output_data` на одинаковые серии.
+Если одинаковые точки встречаются у разных кривых, построение останавливается:
+такие графики визуально выглядят правдоподобно, но фактически искажают отчет.
+Флаг `--allow-duplicates` отключает эту остановку только для ручной отладки.
 
 ## Старый режим командной строки
 
@@ -163,6 +183,59 @@ python3 haake_cli.py template.xlsx structure.txt ./rwd_files --sheet input_data 
 python3 haake_cli.py template.xlsx structure.txt ./rwd_files --recursive --sheet input_data -o result.xlsx
 ```
 
+Если во вложенных папках лежат несколько серий, например `d31`, `d33`, `d35`,
+для полного отчета используйте три связанные команды. Так каждая серия
+обрабатывается из своей папки и записывается только в свою секцию `input_data`.
+
+```bash
+cd /Users/artem/Desktop/Output/iam_ras/haake_parser
+
+TEMPLATE="/Users/artem/Desktop/Output/iam_ras/haake_parser/input/D_series_report_template_first20_clean.xlsx"
+ASCII="/Users/artem/Desktop/Output/iam_ras/haake_parser/input/06_june_proj/d31/2000v/D31_freq=20hz_U=2000v_30_points_ver1.txt"
+INPUT_ROOT="/Users/artem/Desktop/Output/iam_ras/haake_parser/input/06_june_proj"
+OUTPUT="/Users/artem/Desktop/Output/iam_ras/haake_parser/output/D31_D33_D35_06_june_v1_1.xlsx"
+
+python3 haake_cli.py series d31 \
+  --template "$TEMPLATE" \
+  --ascii "$ASCII" \
+  --input-root "$INPUT_ROOT" \
+  -o "$OUTPUT"
+
+python3 haake_cli.py series d33 \
+  --template "$OUTPUT" \
+  --ascii "$ASCII" \
+  --input-root "$INPUT_ROOT" \
+  -o "$OUTPUT"
+
+python3 haake_cli.py series d35 \
+  --template "$OUTPUT" \
+  --ascii "$ASCII" \
+  --input-root "$INPUT_ROOT" \
+  -o "$OUTPUT"
+```
+
+Команда `series d31` начинает отчет из чистого шаблона и создает файл
+`$OUTPUT`. Команды `series d33` и `series d35` открывают уже созданный `$OUTPUT`
+и добавляют только свои секции.
+
+ASCII-файл в этих трех скриптах используется только как структурный эталон:
+состав колонок и длина частотного сегмента. Данные из ASCII переносятся только
+если файл явно передан через `--data-ascii`. В обычном D31/D33/D35 процессе
+этот флаг не нужен: данные берутся из `.rwd`, а пакетные `_good.rwd` выбираются
+раньше одиночных файлов той же частоты.
+
+Шаблон `D_series_template_first20_clean.xlsx` оставлен как технический шаблон
+только для `input_data`; для итогового отчета его использовать не нужно.
+
+Флаг `--include-ascii-data` в основном процессе не используется. Его стоит
+включать только вручную и только если нужно намеренно перенести реальные строки
+из ASCII-файла в Excel.
+
+Одиночные `.rwd` раскладываются по частоте из имени файла. Пакетные `.rwd`
+раскладываются по частотным сегментам. ASCII при этом остается структурным
+файлом: он задает состав колонок и длину сегмента, но не обязан совпадать с
+каждым переданным `.rwd`.
+
 ## Что делает скрипт
 
 1. Открывает Excel-шаблон.
@@ -187,8 +260,9 @@ python3 haake_cli.py template.xlsx structure.txt ./rwd_files --recursive --sheet
 9. Разбирает имена `.rwd`, группирует файлы по составу и напряжению `U=...`.
 10. Внутри каждого общего блока сортирует `.rwd` по частоте.
 11. Добавляет данные в существующие блоки шаблона или ниже существующих данных.
-12. Создает или обновляет лист `instrument_metadata`.
-13. Сохраняет новую Excel-книгу. Исходный шаблон не изменяется.
+12. Проверяет, что в `input_data` не появились повторяющиеся числовые блоки.
+13. Создает или обновляет лист `instrument_metadata`.
+14. Сохраняет новую Excel-книгу. Исходный шаблон не изменяется.
 
 Скрипт `haake_cli.py` не создает Excel-графики, не меняет лист `freq_diagrams`
 и не создает скрытые листы с кривыми для диаграмм.
@@ -288,11 +362,13 @@ python3 haake_plot.py
 
 ```bash
 python3 haake_plot.py \
-  "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/may_proj_v1_2.xlsx" \
+  "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/D31_D33_D35_06_june_v1_1.xlsx" \
   --sheet "output_data" \
-  -o "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/plots" \
+  -o "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/plots_D31_D33_D35_06_june_v1_1" \
   --points 20 \
-  --poly-order 3
+  --poly-order 3 \
+  --legend-columns 3 \
+  --formats png
 ```
 
 Что делает `haake_plot.py`:

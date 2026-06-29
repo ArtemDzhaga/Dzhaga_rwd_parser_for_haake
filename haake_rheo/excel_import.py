@@ -22,6 +22,7 @@ import shlex
 import struct
 import sys
 import time
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +30,7 @@ from typing import Any
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, range_boundaries
 
 
 NUMERIC_RECORD_MARKER = bytes.fromhex("da00da00feff")
@@ -635,6 +636,28 @@ def minimum_segment_points(row_count: int) -> int:
     return max(3, row_count // 2)
 
 
+def ascii_segment_for_identity(segments: list[AsciiSegment], identity: ExperimentIdentity) -> AsciiSegment:
+    if identity.frequency_sort_key is None:
+        raise RuntimeError(f"Не удалось определить частоту для файла с частотой {identity.frequency!r}.")
+    for segment in segments:
+        if value_matches(identity.frequency_sort_key, segment.frequency_sort_key):
+            return AsciiSegment(
+                label=segment.label,
+                start_index=0,
+                row_count=segment.row_count,
+                frequency_sort_key=identity.frequency_sort_key,
+                frequency_label=identity.frequency,
+            )
+    first_segment = segments[0]
+    return AsciiSegment(
+        label=identity.frequency,
+        start_index=0,
+        row_count=first_segment.row_count,
+        frequency_sort_key=identity.frequency_sort_key,
+        frequency_label=identity.frequency,
+    )
+
+
 def available_ascii_segment_indexes(
     record: RwdRecord,
     bindings: list[ChannelBinding],
@@ -696,17 +719,96 @@ def extract_signed_rows(
     for index in range(row_count):
         rows.append(
             [f"1|{index + 1}"]
-            + [excel_value(values[index].value) for values in value_sets]
+            + [measurement_excel_value(values[index].value) for values in value_sets]
         )
     return rows
 
 
-def excel_value(value: float) -> float | str:
+def is_real_number(value: str | float) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def valid_measurement_row_count(rows: list[list[str | float]]) -> int:
+    valid_count = 0
+    for row in rows:
+        if len(row) < 7:
+            continue
+        t_seg, tau, g_prime, g_double_prime, eta, gamma = row[1:7]
+        if not all(is_real_number(value) for value in (t_seg, tau, g_prime, g_double_prime, eta, gamma)):
+            continue
+        if (
+            float(t_seg) > 0
+            and abs(float(tau)) > 1e-9
+            and abs(float(g_prime)) > 10
+            and abs(float(g_double_prime)) > 1e-9
+            and abs(float(eta)) > 10
+            and float(gamma) > 1e-8
+        ):
+            valid_count += 1
+    return valid_count
+
+
+def measurement_quality_note(record: RwdRecord, frequency: float, valid_count: int, expected_count: int) -> str:
+    return (
+        f"{record.path.name}: сегмент {frequency:g} Гц пропущен: "
+        f"найдено только {valid_count} физически валидных строк из {expected_count}. "
+        "Похоже, рабочие бинарные каналы файла пустые или повреждены."
+    )
+
+
+def record_measurement_segments(
+    record: RwdRecord,
+    record_bindings: list[ChannelBinding],
+    segments: list[AsciiSegment],
+    identity: ExperimentIdentity,
+) -> list[tuple[int, int | None, AsciiSegment, int]]:
+    if record_bindings and record_bindings[0].segment_offsets:
+        try:
+            matched = available_ascii_segment_indexes(record, record_bindings, segments)
+        except RuntimeError as error:
+            if identity.is_batch:
+                raise RuntimeError(str(error)) from error
+            matched = []
+        if matched:
+            return [
+                (ascii_segment_index, record_segment_index, segments[ascii_segment_index], matched_row_count)
+                for ascii_segment_index, record_segment_index, matched_row_count in matched
+            ]
+
+    if identity.is_batch:
+        raise RuntimeError(f"Файл {record.path.name}: не удалось сопоставить частотные сегменты с ASCII.")
+
+    segment = ascii_segment_for_identity(segments, identity)
+    return [
+        (
+            0,
+            0 if record_bindings and record_bindings[0].segment_offsets else None,
+            segment,
+            segment.row_count,
+        )
+    ]
+
+
+def raw_excel_value(value: float) -> float | str:
     if math.isnan(value):
         return "NaN"
     if math.isinf(value):
         return "+Inf" if value > 0 else "-Inf"
     return value
+
+
+def round_significant(value: float, digits: int = 4) -> float:
+    if value == 0 or not math.isfinite(value):
+        return value
+    decimals = digits - int(math.floor(math.log10(abs(value)))) - 1
+    return round(value, decimals)
+
+
+def measurement_excel_value(value: float) -> float | str:
+    raw_value = raw_excel_value(value)
+    if isinstance(raw_value, str):
+        return raw_value
+    return round_significant(raw_value)
 
 
 def collect_rwd_files(paths: list[Path], recursive: bool) -> list[Path]:
@@ -723,7 +825,131 @@ def collect_rwd_files(paths: list[Path], recursive: bool) -> list[Path]:
                 f"Не найден переданный .rwd файл или папка: {visible_path!r}. "
                 "Проверьте, что путь не содержит перенос строки внутри кавычек."
             )
-    return sorted(set(file.resolve() for file in files), key=lambda path: path.name.lower())
+    return normalize_collected_rwd_files(sorted(set(file.resolve() for file in files), key=lambda path: path.name.lower()))
+
+
+def series_folder_name(path: Path) -> str | None:
+    if re.fullmatch(r"d\d+", path.name, re.I):
+        return path.name.upper()
+    return None
+
+
+def nearest_series_folder_name(path: Path) -> str | None:
+    for parent in [path.parent, *path.parents]:
+        name = series_folder_name(parent)
+        if name is not None:
+            return name
+    return None
+
+
+def series_folder_sort_key(item: tuple[str, list[Path]]) -> tuple[int, str]:
+    name, _ = item
+    match = re.search(r"\d+", name)
+    return (int(match.group(0)) if match else 10**9, name)
+
+
+def collect_series_folder_file_groups(paths: list[Path], recursive: bool) -> list[tuple[str, list[Path]]]:
+    grouped: dict[str, list[Path]] = {}
+    for path in paths:
+        expanded = path.expanduser()
+        if expanded.is_file() and expanded.suffix.lower() == ".rwd":
+            series_name = nearest_series_folder_name(expanded) or experiment_series_name_from_identity(
+                parse_experiment_identity(expanded)
+            )
+            grouped.setdefault(series_name.upper(), []).append(expanded.resolve())
+            continue
+        if not expanded.is_dir():
+            visible_path = str(path).replace("\n", "\\n")
+            raise RuntimeError(
+                f"Не найден переданный .rwd файл или папка: {visible_path!r}. "
+                "Проверьте, что путь не содержит перенос строки внутри кавычек."
+            )
+
+        candidate_dirs: list[Path] = []
+        own_name = series_folder_name(expanded)
+        if own_name is not None:
+            candidate_dirs.append(expanded)
+        else:
+            search_dirs = expanded.rglob("*") if recursive else expanded.iterdir()
+            candidate_dirs.extend(item for item in search_dirs if item.is_dir() and series_folder_name(item))
+
+        if candidate_dirs:
+            seen_dirs: set[Path] = set()
+            for directory in sorted(candidate_dirs, key=lambda item: item.name.lower()):
+                resolved_dir = directory.resolve()
+                if resolved_dir in seen_dirs:
+                    continue
+                seen_dirs.add(resolved_dir)
+                name = series_folder_name(directory)
+                if name is None:
+                    continue
+                pattern_files = directory.rglob("*.rwd") if recursive else directory.glob("*.rwd")
+                grouped.setdefault(name, []).extend(file.resolve() for file in pattern_files)
+        else:
+            pattern_files = expanded.rglob("*.rwd") if recursive else expanded.glob("*.rwd")
+            for file in pattern_files:
+                series_name = nearest_series_folder_name(file) or experiment_series_name_from_identity(
+                    parse_experiment_identity(file)
+                )
+                grouped.setdefault(series_name.upper(), []).append(file.resolve())
+
+    result: list[tuple[str, list[Path]]] = []
+    for series_name, files in grouped.items():
+        normalized = normalize_collected_rwd_files(sorted(set(files), key=lambda item: item.name.lower()))
+        if normalized:
+            result.append((series_name, normalized))
+    return sorted(result, key=series_folder_sort_key)
+
+
+def voltage_folder_hint(path: Path) -> str | None:
+    for parent in path.parents:
+        if re.fullmatch(r"\d+v", parent.name, re.I):
+            return parent.name.lower()
+    return None
+
+
+def rwd_preference_key(path: Path) -> tuple[int, int, str]:
+    name = path.stem.lower()
+    return (
+        1 if "_good" in name else 0,
+        -1 if "_bad" in name else 0,
+        path.name.lower(),
+    )
+
+
+def normalize_collected_rwd_files(files: list[Path]) -> list[Path]:
+    selected: dict[tuple[str, str, float | str], Path] = {}
+    skipped_voltage_mismatch: list[str] = []
+    skipped_duplicates: list[str] = []
+
+    for file in files:
+        identity = parse_experiment_identity(file)
+        folder_voltage = voltage_folder_hint(file)
+        file_voltage = identity.voltage.removeprefix("U=").lower()
+        if folder_voltage is not None and folder_voltage != file_voltage:
+            skipped_voltage_mismatch.append(f"{file.name} ({folder_voltage} folder, {identity.voltage} in name)")
+            continue
+
+        frequency_key: float | str = "__batch__" if identity.is_batch else float(identity.frequency_sort_key)
+        duplicate_key = (experiment_series_name_from_identity(identity).lower(), file_voltage, frequency_key)
+        current = selected.get(duplicate_key)
+        if current is None or rwd_preference_key(file) > rwd_preference_key(current):
+            if current is not None:
+                skipped_duplicates.append(f"{current.name} -> выбран {file.name}")
+            selected[duplicate_key] = file
+        else:
+            skipped_duplicates.append(f"{file.name} -> оставлен {current.name}")
+
+    if skipped_voltage_mismatch:
+        print("Пропущены .rwd с несовпадением напряжения в имени файла и родительской папке:")
+        for item in skipped_voltage_mismatch:
+            print(f"  - {item}")
+    if skipped_duplicates:
+        print("Найдены дубли одной частоты; выбран один файл:")
+        for item in skipped_duplicates:
+            print(f"  - {item}")
+
+    return sorted(selected.values(), key=lambda path: (path.parent.name.lower(), path.name.lower()))
 
 
 def parse_experiment_identity(path: Path) -> ExperimentIdentity:
@@ -737,18 +963,18 @@ def parse_experiment_identity(path: Path) -> ExperimentIdentity:
             f"Не удалось разобрать имя файла {path.name!r}. "
             "Ожидается шаблон: <состав>_freq=<частота>_U=<напряжение>_<прочие параметры>.rwd"
         )
-    frequency = match.group("frequency")
+    frequency = match.group("frequency").strip("_")
     is_batch = "from" in frequency.lower() and "to" in frequency.lower()
     if is_batch:
         return ExperimentIdentity(
             block_name=f"{match.group('prefix')}_{match.group('voltage')}",
             voltage=match.group("voltage"),
-            frequency=frequency.strip("_"),
+            frequency=frequency,
             frequency_sort_key=None,
             is_batch=True,
         )
 
-    frequency_number = frequency.lower().removesuffix("hz").replace(",", ".")
+    frequency_number = frequency.lower().strip("_").removesuffix("hz").strip("_").replace(",", ".")
     try:
         if "." not in frequency_number and len(frequency_number) > 1 and frequency_number.startswith("0"):
             sort_key = float(f"0.{frequency_number[1:]}")
@@ -762,6 +988,64 @@ def parse_experiment_identity(path: Path) -> ExperimentIdentity:
         frequency=frequency,
         frequency_sort_key=sort_key,
         is_batch=False,
+    )
+
+
+def experiment_series_name(record: RwdRecord) -> str:
+    identity = parse_experiment_identity(record.path)
+    return experiment_series_name_from_identity(identity)
+
+
+def experiment_series_name_from_identity(identity: ExperimentIdentity) -> str:
+    marker = f"_{identity.voltage}"
+    if marker in identity.block_name:
+        return identity.block_name.rsplit(marker, 1)[0]
+    return identity.block_name
+
+
+def path_name_from_any_platform(path_text: str) -> str:
+    parts = re.split(r"[\\/]+", path_text.strip())
+    return parts[-1] if parts else path_text
+
+
+def ascii_record_identity(ascii_record: AsciiRecord) -> ExperimentIdentity:
+    path_identity = parse_experiment_identity(ascii_record.path)
+    if not ascii_record.source_rwd_path:
+        return path_identity
+
+    try:
+        source_identity = parse_experiment_identity(Path(path_name_from_any_platform(ascii_record.source_rwd_path)))
+    except RuntimeError:
+        return path_identity
+
+    if (
+        path_identity.block_name.lower() != source_identity.block_name.lower()
+        or path_identity.frequency_sort_key != source_identity.frequency_sort_key
+    ):
+        return path_identity
+    return source_identity
+
+
+def group_records_by_series(records: list[RwdRecord]) -> list[tuple[str, list[RwdRecord]]]:
+    grouped: dict[str, list[RwdRecord]] = {}
+    for record in records:
+        grouped.setdefault(experiment_series_name(record), []).append(record)
+    return [
+        (series_name, sorted(items, key=lambda record: record.path.name.lower()))
+        for series_name, items in sorted(grouped.items(), key=lambda item: item[0].lower())
+    ]
+
+
+def measurement_source_sort_key(record: RwdRecord) -> tuple[str, str, int, int, str]:
+    identity = parse_experiment_identity(record.path)
+    voltage = identity.voltage.removeprefix("U=").lower()
+    name = record.path.stem.lower()
+    return (
+        experiment_series_name_from_identity(identity).lower(),
+        voltage,
+        0 if "_good" in name else 1,
+        0 if identity.is_batch else 1,
+        record.path.name.lower(),
     )
 
 
@@ -813,9 +1097,10 @@ def existing_block_names(ws) -> set[str]:
     }
 
 
-def template_voltage_rows(ws) -> dict[str, int]:
+def template_voltage_rows(ws, min_row: int = 1, max_row: int | None = None) -> dict[str, int]:
     rows: dict[str, int] = {}
-    for row in range(1, ws.max_row + 1):
+    last_row = max_row if max_row is not None else ws.max_row
+    for row in range(min_row, last_row + 1):
         value = ws.cell(row, 2).value
         if not isinstance(value, str):
             continue
@@ -858,6 +1143,67 @@ def find_frequency_column(columns: dict[float, int], frequency: float) -> int:
     )
 
 
+def duplicate_number(value: Any) -> float | str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return round(float(value), 8)
+    try:
+        return round(float(str(value).replace(",", ".")), 8)
+    except ValueError:
+        return str(value).strip()
+
+
+def duplicate_block_signature(ws, block_row: int, frequency_start_column: int) -> tuple[tuple[float | str | None, ...], ...]:
+    return tuple(
+        tuple(duplicate_number(ws.cell(row, frequency_start_column + column_offset).value) for column_offset in range(6))
+        for row in range(block_row + 3, block_row + 33)
+    )
+
+
+def nonempty_signature_rows(signature: tuple[tuple[float | str | None, ...], ...]) -> int:
+    return sum(1 for row in signature if any(value is not None for value in row))
+
+
+def duplicate_input_data_blocks(ws, min_row: int = 1, max_row: int | None = None) -> list[list[str]]:
+    groups: dict[tuple[tuple[float | str | None, ...], ...], list[str]] = {}
+    for voltage, block_row in template_voltage_rows(ws, min_row, max_row).items():
+        block_title = str(ws.cell(block_row, 2).value or f"U={voltage}")
+        for frequency, start_column in template_frequency_columns(ws, block_row).items():
+            signature = duplicate_block_signature(ws, block_row, start_column)
+            if nonempty_signature_rows(signature) < minimum_segment_points(len(signature)):
+                continue
+            groups.setdefault(signature, []).append(
+                f"{block_title}: U={voltage}, {frequency:g} Гц"
+            )
+    return [items for items in groups.values() if len(items) > 1]
+
+
+def format_duplicate_groups(groups: list[list[str]], limit: int = 8) -> str:
+    lines = [
+        "Найдены повторяющиеся числовые блоки. "
+        "Это почти наверняка означает, что одна и та же серия записана в разные частоты."
+    ]
+    for index, group in enumerate(groups[:limit], start=1):
+        lines.append(f"Дубль {index}:")
+        lines.extend(f"  - {item}" for item in group)
+    if len(groups) > limit:
+        lines.append(f"... и еще {len(groups) - limit} групп дублей.")
+    lines.append("Запись остановлена. Проверьте исходные .rwd/ASCII или запустите с --allow-duplicates.")
+    return "\n".join(lines)
+
+
+def validate_no_input_duplicates(workbook, sheet_name: str, allow_duplicates: bool) -> list[list[str]]:
+    if sheet_name not in workbook.sheetnames:
+        return []
+    groups = duplicate_input_data_blocks(workbook[sheet_name])
+    if groups and not allow_duplicates:
+        raise RuntimeError(format_duplicate_groups(groups))
+    return groups
+
+
 def filename_frequency_note(identity: ExperimentIdentity, frequencies: list[float]) -> str:
     if identity.is_batch or identity.frequency_sort_key is None or not frequencies:
         return ""
@@ -891,7 +1237,7 @@ def validate_record_frequency(
     bindings: list[ChannelBinding],
     start_index: int = 0,
     segment_index: int | None = None,
-) -> None:
+) -> str:
     frequency_binding = next(
         (
             binding
@@ -901,19 +1247,36 @@ def validate_record_frequency(
         None,
     )
     if frequency_binding is None:
-        raise RuntimeError("В ASCII структуры отсутствует обязательная колонка 'f in Hz'.")
-    actual_values = resolve_values_slice(
-        record,
-        frequency_binding,
-        start_index,
-        row_count,
-        segment_index,
-    )
-    if not all(value_matches(frequency, item.value) for item in actual_values):
-        raise RuntimeError(
-            f"Файл {record.path.name}: канал частоты не соответствует имени файла "
-            f"или ASCII-сегменту ({frequency:g} Гц). Для этой структуры нужен отдельный ASCII-файл."
+        return "В ASCII структуры отсутствует обязательная колонка 'f in Hz'."
+    try:
+        actual_values = resolve_values_slice(
+            record,
+            frequency_binding,
+            start_index,
+            row_count,
+            segment_index,
         )
+    except RuntimeError as error:
+        return f"канал частоты не прочитан: {error}"
+
+    matched = sum(1 for item in actual_values if value_matches(frequency, item.value))
+    if matched >= minimum_segment_points(row_count):
+        return ""
+
+    finite_values = [
+        item.value
+        for item in actual_values
+        if math.isfinite(item.value) and abs(item.value) > 1e-12
+    ]
+    if not finite_values:
+        return "канал частоты пустой или служебный; частота взята из имени файла/ASCII-сегмента"
+
+    preview = ", ".join(f"{value:g}" for value in finite_values[:5])
+    return (
+        f"канал частоты не подтверждает {frequency:g} Гц "
+        f"({matched} из {row_count}; первые значения: {preview}); "
+        "данные записаны по имени файла/ASCII-сегменту"
+    )
 
 
 def fill_template_measurement_blocks(
@@ -921,8 +1284,10 @@ def fill_template_measurement_blocks(
     records: list[RwdRecord],
     ascii_record: AsciiRecord,
     bindings: list[ChannelBinding],
+    min_row: int = 1,
+    max_row: int | None = None,
 ) -> list[str] | None:
-    voltage_rows = template_voltage_rows(ws)
+    voltage_rows = template_voltage_rows(ws, min_row, max_row)
     if not voltage_rows:
         return None
 
@@ -931,7 +1296,7 @@ def fill_template_measurement_blocks(
     touched_voltages: set[str] = set()
     written_by_voltage: dict[str, set[float]] = {}
     report: list[str] = []
-    for record in records:
+    for record in sorted(records, key=measurement_source_sort_key):
         identity = parse_experiment_identity(record.path)
         record_bindings = adapt_bindings_to_record(bindings, record)
         selected_bindings = display_bindings(record_bindings)
@@ -942,44 +1307,21 @@ def fill_template_measurement_blocks(
             raise RuntimeError(
                 f"В Excel-шаблоне отсутствует блок напряжения {identity.voltage!r}."
             )
-        if identity.is_batch or len(segments) > 1:
-            record_segments = [
-                (ascii_segment_index, record_segment_index, segments[ascii_segment_index], matched_row_count)
-                for ascii_segment_index, record_segment_index, matched_row_count in available_ascii_segment_indexes(
-                    record,
-                    record_bindings,
-                    segments,
-                )
-            ]
-        else:
-            record_segments = [
-                (
-                    0,
-                    0,
-                    AsciiSegment(
-                        label=segments[0].label,
-                        start_index=segments[0].start_index,
-                        row_count=segments[0].row_count,
-                        frequency_sort_key=identity.frequency_sort_key,
-                        frequency_label=identity.frequency,
-                    ),
-                    segments[0].row_count,
-                )
-            ]
+        record_segments = record_measurement_segments(record, record_bindings, segments, identity)
 
         written_frequencies: list[float] = []
         segment_counts: list[tuple[float, int, int]] = []
+        frequency_notes: list[str] = []
         for ascii_segment_index, record_segment_index, segment, matched_row_count in record_segments:
             if segment.frequency_sort_key is None:
                 raise RuntimeError(f"Не удалось определить частоту для файла {record.path.name!r}.")
             duplicate_key = (voltage, segment.frequency_sort_key)
             if duplicate_key in seen:
-                raise RuntimeError(
-                    f"Для напряжения {identity.voltage!r} передано несколько файлов "
-                    f"или сегментов частоты {segment.frequency_sort_key:g} Гц."
+                frequency_notes.append(
+                    f"{segment.frequency_sort_key:g} Гц: повторный источник {record.path.name} пропущен"
                 )
-            seen.add(duplicate_key)
-            validate_record_frequency(
+                continue
+            frequency_note = validate_record_frequency(
                 record,
                 segment.frequency_sort_key,
                 matched_row_count,
@@ -987,6 +1329,8 @@ def fill_template_measurement_blocks(
                 segment.start_index,
                 record_segment_index,
             )
+            if frequency_note:
+                frequency_notes.append(f"{segment.frequency_sort_key:g} Гц: {frequency_note}")
 
             frequency_start_column = find_frequency_column(
                 template_frequency_columns(ws, block_row),
@@ -999,6 +1343,19 @@ def fill_template_measurement_blocks(
                 segment.start_index,
                 record_segment_index,
             )
+            valid_count = valid_measurement_row_count(rows)
+            if valid_count < minimum_segment_points(matched_row_count):
+                frequency_notes.append(
+                    measurement_quality_note(
+                        record,
+                        segment.frequency_sort_key,
+                        valid_count,
+                        matched_row_count,
+                    )
+                )
+                continue
+
+            seen.add(duplicate_key)
             for row_offset, values in enumerate(rows, start=3):
                 ws.cell(block_row + row_offset, frequency_start_column - 1, values[0])
                 for column_offset, value in enumerate(values[1:]):
@@ -1006,11 +1363,18 @@ def fill_template_measurement_blocks(
             written_frequencies.append(segment.frequency_sort_key)
             written_by_voltage.setdefault(voltage, set()).add(segment.frequency_sort_key)
             segment_counts.append((segment.frequency_sort_key, matched_row_count, segment.row_count))
-        frequencies = ", ".join(f"{frequency:g} Гц" for frequency in sorted(written_frequencies))
+        frequencies = ", ".join(f"{frequency:g} Гц" for frequency in sorted(written_frequencies)) or "нет записанных частот"
         report.append(
             f"{record.path.name}: блок {identity.voltage}, частоты: {frequencies}"
             + filename_frequency_note(identity, written_frequencies)
             + partial_segment_note(segment_counts)
+            + (
+                " ВНИМАНИЕ: "
+                + "; ".join(frequency_notes)
+                + "."
+                if frequency_notes
+                else ""
+            )
         )
     for voltage in sorted(touched_voltages):
         block_row = voltage_rows[voltage]
@@ -1030,13 +1394,136 @@ def fill_template_measurement_blocks(
     return report
 
 
+def ascii_display_column_indexes(ascii_record: AsciiRecord) -> list[tuple[str, int]]:
+    by_header = {normalize_header(header): index for index, header in enumerate(ascii_record.headers)}
+    result: list[tuple[str, int]] = []
+    missing: list[str] = []
+    for ascii_header, display_header in DISPLAY_COLUMNS:
+        index = by_header.get(normalize_header(ascii_header))
+        if index is None:
+            missing.append(ascii_header)
+        else:
+            result.append((display_header, index))
+    if missing:
+        raise RuntimeError(
+            "В ASCII структуры отсутствуют обязательные рабочие колонки: "
+            + ", ".join(missing)
+        )
+    return result
+
+
+def ascii_row_values(
+    ascii_record: AsciiRecord,
+    row_index: int,
+    selected_columns: list[tuple[str, int]],
+) -> list[str | float]:
+    row = ascii_record.rows[row_index]
+    return [row[0]] + [row[column_index] for _, column_index in selected_columns]
+
+
+def fill_ascii_measurement_blocks(
+    ws,
+    ascii_record: AsciiRecord,
+    min_row: int = 1,
+    max_row: int | None = None,
+) -> list[str]:
+    identity = ascii_record_identity(ascii_record)
+    voltage = identity.voltage.removeprefix("U=").lower()
+    voltage_rows = template_voltage_rows(ws, min_row, max_row)
+    block_row = voltage_rows.get(voltage)
+    if block_row is None:
+        raise RuntimeError(
+            f"В Excel-шаблоне отсутствует блок напряжения {identity.voltage!r} "
+            f"для ASCII-данных {ascii_record.path.name!r}."
+        )
+
+    selected_columns = ascii_display_column_indexes(ascii_record)
+    written: list[float] = []
+    skipped: list[float] = []
+    for segment in ascii_segments(ascii_record):
+        frequency_start_column = find_frequency_column(
+            template_frequency_columns(ws, block_row),
+            segment.frequency_sort_key,
+        )
+        first_value_cell = ws.cell(block_row + 3, frequency_start_column)
+        if first_value_cell.value not in (None, ""):
+            skipped.append(segment.frequency_sort_key)
+            continue
+        for row_offset in range(segment.row_count):
+            values = ascii_row_values(
+                ascii_record,
+                segment.start_index + row_offset,
+                selected_columns,
+            )
+            target_row = block_row + 3 + row_offset
+            ws.cell(target_row, frequency_start_column - 1, values[0])
+            for column_offset, value in enumerate(values[1:]):
+                ws.cell(target_row, frequency_start_column + column_offset, value)
+        written.append(segment.frequency_sort_key)
+
+    message = (
+        f"ASCII-данные {ascii_record.path.name}: блок {identity.voltage}, "
+        f"частоты: {', '.join(f'{frequency:g} Гц' for frequency in written) or 'нет записанных частот'}"
+    )
+    if skipped:
+        message += (
+            " ВНИМАНИЕ: пропущены уже заполненные частоты: "
+            + ", ".join(f"{frequency:g} Гц" for frequency in skipped)
+            + "."
+        )
+    return [message]
+
+
+def fill_ascii_data_into_workbook(
+    workbook,
+    sheet_name: str,
+    ascii_record: AsciiRecord,
+    record_groups: list[tuple[str, list[RwdRecord]]] | None = None,
+    target_series: str | None = None,
+) -> list[str]:
+    ws = workbook[sheet_name]
+    ascii_identity = ascii_record_identity(ascii_record)
+    ascii_series = experiment_series_name_from_identity(ascii_identity).upper()
+    series_names = [target_series.upper()] if target_series else []
+    if record_groups is not None:
+        series_names.extend(series_name for series_name, _ in record_groups)
+    if not series_names:
+        return fill_ascii_measurement_blocks(ws, ascii_record)
+
+    regions = existing_series_regions(ws, series_names)
+    target_key = target_series.upper() if target_series else ascii_series
+    if target_key != ascii_series:
+        raise RuntimeError(
+            f"ASCII-данные {ascii_record.path.name!r} относятся к серии {ascii_series!r}, "
+            f"а команда ограничена серией {target_key!r}."
+        )
+    if target_key not in regions:
+        raise RuntimeError(
+            f"ASCII-данные относятся к серии {target_key!r}, но в шаблоне не найдена "
+            f"соответствующая секция на листе {sheet_name!r}."
+        )
+
+    region_start, region_end = regions[target_key]
+    report = fill_ascii_measurement_blocks(ws, ascii_record, region_start, region_end)
+    return [f"{target_key}: {line}" for line in report]
+
+
 def append_measurement_blocks(
     ws,
     records: list[RwdRecord],
     ascii_record: AsciiRecord,
     bindings: list[ChannelBinding],
+    min_row: int = 1,
+    max_row: int | None = None,
 ) -> list[str]:
-    template_report = fill_template_measurement_blocks(ws, records, ascii_record, bindings)
+    template_report = fill_template_measurement_blocks(
+        ws,
+        records,
+        ascii_record,
+        bindings,
+        min_row,
+        max_row,
+    )
     if template_report is not None:
         return template_report
 
@@ -1071,41 +1558,24 @@ def append_measurement_blocks(
         for identity, record in items:
             record_bindings = adapt_bindings_to_record(bindings, record)
             selected_bindings = display_bindings(record_bindings)
-            if identity.is_batch or len(segments) > 1:
-                subblocks.extend(
-                    (
-                        segment.frequency_sort_key,
-                        segment.frequency_label,
-                        record,
-                        record_bindings,
-                        selected_bindings,
-                        segment.start_index,
-                        row_count,
-                        record_segment_index,
-                    )
-                    for ascii_segment_index, record_segment_index, matched_row_count in available_ascii_segment_indexes(
-                        record,
-                        record_bindings,
-                        segments,
-                    )
-                    for segment in [segments[ascii_segment_index]]
-                    for row_count in [matched_row_count]
+            subblocks.extend(
+                (
+                    segment.frequency_sort_key,
+                    segment.frequency_label,
+                    record,
+                    record_bindings,
+                    selected_bindings,
+                    segment.start_index,
+                    row_count,
+                    record_segment_index,
                 )
-            else:
-                if identity.frequency_sort_key is None:
-                    raise RuntimeError(f"Не удалось определить частоту из имени файла {record.path.name!r}.")
-                subblocks.append(
-                    (
-                        identity.frequency_sort_key,
-                        identity.frequency,
-                        record,
-                        record_bindings,
-                        selected_bindings,
-                        segments[0].start_index,
-                        segments[0].row_count,
-                        0 if bindings and bindings[0].segment_offsets else None,
-                    )
+                for _, record_segment_index, segment, row_count in record_measurement_segments(
+                    record,
+                    record_bindings,
+                    segments,
+                    identity,
                 )
+            )
 
         duplicate_frequencies = {
             frequency
@@ -1118,6 +1588,8 @@ def append_measurement_blocks(
                 + ", ".join(f"{frequency:g} Гц" for frequency in sorted(duplicate_frequencies))
             )
 
+        frequency_notes: list[str] = []
+        written_subblock_frequencies: list[float] = []
         max_row_count = max(row_count for _, _, _, _, _, _, row_count, _ in subblocks)
         for frequency_index, (
             frequency,
@@ -1133,16 +1605,31 @@ def append_measurement_blocks(
         ):
             frequency_start_column = 1 + frequency_index * 7
             value_start_column = frequency_start_column + 1
-            validate_record_frequency(record, frequency, row_count, record_bindings, start_index, segment_index)
+            frequency_note = validate_record_frequency(
+                record,
+                frequency,
+                row_count,
+                record_bindings,
+                start_index,
+                segment_index,
+            )
+            if frequency_note:
+                frequency_notes.append(f"{frequency:g} Гц: {frequency_note}")
+            rows = extract_signed_rows(record, row_count, selected_bindings, start_index, segment_index)
+            valid_count = valid_measurement_row_count(rows)
+            if valid_count < minimum_segment_points(row_count):
+                frequency_notes.append(measurement_quality_note(record, frequency, valid_count, row_count))
+                continue
+
             ws.cell(block_start_row + 1, value_start_column, frequency_label)
             for column_offset, (display_header, _) in enumerate(selected_bindings):
                 ws.cell(block_start_row + 2, value_start_column + column_offset, display_header)
 
-            rows = extract_signed_rows(record, row_count, selected_bindings, start_index, segment_index)
             for row_offset, row in enumerate(rows, start=3):
                 ws.cell(block_start_row + row_offset, frequency_start_column, row[0])
                 for column_offset, value in enumerate(row[1:]):
                     ws.cell(block_start_row + row_offset, value_start_column + column_offset, value)
+            written_subblock_frequencies.append(frequency)
 
             for row in (block_start_row + 1, block_start_row + 2):
                 for column in range(frequency_start_column, frequency_start_column + 7):
@@ -1153,8 +1640,9 @@ def append_measurement_blocks(
                         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             for column in range(frequency_start_column, frequency_start_column + 7):
                 ws.column_dimensions[get_column_letter(column)].width = 18
-        report_frequencies = ", ".join(
-            f"{frequency:g} Гц" for frequency, *_ in sorted(subblocks, key=lambda item: item[0])
+        report_frequencies = (
+            ", ".join(f"{frequency:g} Гц" for frequency in sorted(written_subblock_frequencies))
+            or "нет записанных частот"
         )
         notes = [
             filename_frequency_note(identity, [frequency])
@@ -1164,9 +1652,16 @@ def append_measurement_blocks(
         report.append(
             f"Добавлен новый блок {block_name}: частоты: {report_frequencies}"
             + "".join(note for note in notes if note)
+            + (
+                " ВНИМАНИЕ: "
+                + "; ".join(frequency_notes)
+                + "."
+                if frequency_notes
+                else ""
+            )
         )
         block_start_row += max_row_count + 5
-    ws.freeze_panes = "B4"
+    ws.freeze_panes = None
     return report
 
 
@@ -1295,10 +1790,234 @@ def write_diagnostics_sheet(workbook, records: list[RwdRecord]) -> None:
                         value_index,
                         hex(item.offset),
                         item.raw_hex_le,
-                        excel_value(item.value),
+                        raw_excel_value(item.value),
                     ]
                 )
     style_table(ws)
+
+
+def clear_report_freeze_panes(workbook) -> None:
+    for sheet_name in ("freq_diagrams", "input_data", "output_data"):
+        if sheet_name in workbook.sheetnames:
+            workbook[sheet_name].freeze_panes = None
+
+
+def safe_sheet_suffix(value: str) -> str:
+    cleaned = re.sub(r"[\[\]:*?/\\]", "_", value.strip())
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "series"
+
+
+def sheet_name_for(base_name: str, suffix: str) -> str:
+    suffix = safe_sheet_suffix(suffix)
+    max_base_length = 31 - len(suffix) - 1
+    if max_base_length < 1:
+        return suffix[-31:]
+    return f"{base_name[:max_base_length]}_{suffix}"
+
+
+def remove_sheet_if_exists(workbook, sheet_name: str) -> None:
+    if sheet_name in workbook.sheetnames:
+        del workbook[sheet_name]
+
+
+def replace_formula_sheet_reference(formula: str, old_sheet: str, new_sheet: str) -> str:
+    replacements = {
+        f"'{old_sheet}'!": f"'{new_sheet}'!",
+        f"{old_sheet}!": f"{new_sheet}!",
+    }
+    result = formula
+    for old_value, new_value in replacements.items():
+        result = result.replace(old_value, new_value)
+    return result
+
+
+def relink_formulas_to_input_sheet(ws, old_input_sheet: str, new_input_sheet: str) -> None:
+    for row in ws.iter_rows():
+        for cell in row:
+            value = cell.value
+            if isinstance(value, str) and value.startswith("="):
+                cell.value = replace_formula_sheet_reference(value, old_input_sheet, new_input_sheet)
+
+
+def copy_row_region(ws, source_start: int, source_end: int, target_start: int) -> None:
+    row_offset = target_start - source_start
+    for row in range(source_start, source_end + 1):
+        target_row = row + row_offset
+        if row in ws.row_dimensions:
+            ws.row_dimensions[target_row].height = ws.row_dimensions[row].height
+        for column in range(1, ws.max_column + 1):
+            source_cell = ws.cell(row, column)
+            target_cell = ws.cell(target_row, column)
+            target_cell.value = source_cell.value
+            if source_cell.has_style:
+                target_cell._style = copy(source_cell._style)
+            if source_cell.number_format:
+                target_cell.number_format = source_cell.number_format
+            if source_cell.alignment:
+                target_cell.alignment = copy(source_cell.alignment)
+            if source_cell.font:
+                target_cell.font = copy(source_cell.font)
+            if source_cell.fill:
+                target_cell.fill = copy(source_cell.fill)
+            if source_cell.border:
+                target_cell.border = copy(source_cell.border)
+            if source_cell.protection:
+                target_cell.protection = copy(source_cell.protection)
+
+    for merged_range in list(ws.merged_cells.ranges):
+        min_col, min_row, max_col, max_row = range_boundaries(str(merged_range))
+        if min_row < source_start or max_row > source_end:
+            continue
+        shifted_range = (
+            f"{get_column_letter(min_col)}{min_row + row_offset}:"
+            f"{get_column_letter(max_col)}{max_row + row_offset}"
+        )
+        if shifted_range not in ws.merged_cells:
+            ws.merge_cells(shifted_range)
+
+
+def rename_series_block_titles(ws, series_name: str, min_row: int, max_row: int) -> None:
+    for row in range(min_row, max_row + 1):
+        value = ws.cell(row, 2).value
+        if not isinstance(value, str):
+            continue
+        match = re.search(r"_U=(\d+v)_", value, re.I)
+        if match:
+            ws.cell(row, 2).value = f"{series_name}_U={match.group(1).lower()}_30_points"
+
+
+def existing_series_regions(ws, series_names: list[str]) -> dict[str, tuple[int, int]]:
+    all_starts: list[tuple[int, str]] = []
+    wanted = {series_name.lower(): series_name for series_name in series_names}
+    for row in range(1, ws.max_row + 1):
+        value = ws.cell(row, 2).value
+        if not isinstance(value, str):
+            continue
+        match = re.match(r"(?P<series>.+?)_U=\d+v_", value.strip(), re.I)
+        if match is None:
+            continue
+        series_key = match.group("series").lower()
+        if not any(existing_key == series_key for _, existing_key in all_starts):
+            all_starts.append((row, series_key))
+    all_starts.sort()
+
+    regions: dict[str, tuple[int, int]] = {}
+    for index, (start_row, series_key) in enumerate(all_starts):
+        if series_key not in wanted:
+            continue
+        if index + 1 < len(all_starts):
+            next_start = all_starts[index + 1][0]
+            end_row = next_start - 3 if next_start - start_row > 2 else next_start - 1
+        else:
+            end_row = ws.max_row
+        regions[wanted[series_key]] = (start_row, end_row)
+    return regions
+
+
+def fill_workbook_measurements(
+    workbook,
+    sheet_name: str,
+    records: list[RwdRecord],
+    ascii_record: AsciiRecord,
+    bindings: list[ChannelBinding],
+) -> list[str]:
+    series_groups = group_records_by_series(records)
+    if len(series_groups) <= 1:
+        ws = workbook[sheet_name]
+        series_name = series_groups[0][0] if series_groups else ""
+        regions = existing_series_regions(ws, [series_name]) if series_name else {}
+        if series_name in regions:
+            region_start, region_end = regions[series_name]
+            report = [
+                f"Серия {series_name}: запись только в строки {region_start}-{region_end} листа {sheet_name!r}."
+            ]
+            series_report = append_measurement_blocks(
+                ws,
+                records,
+                ascii_record,
+                bindings,
+                region_start,
+                region_end,
+            )
+            report.extend(f"{series_name}: {line}" for line in series_report)
+            return report
+        return append_measurement_blocks(ws, records, ascii_record, bindings)
+
+    ws = workbook[sheet_name]
+    template_start = 1
+    template_end = ws.max_row
+    template_height = template_end - template_start + 1
+    series_names = [series_name for series_name, _ in series_groups]
+    regions = existing_series_regions(ws, series_names)
+    report: list[str] = [
+        f"Найдено несколько серий экспериментов; все серии записаны на один лист {sheet_name!r}."
+    ]
+
+    if not all(series_name in regions for series_name in series_names):
+        for index, _ in enumerate(series_groups[1:], start=1):
+            region_start = template_start + index * (template_height + 2)
+            copy_row_region(ws, template_start, template_end, region_start)
+        regions = {}
+        for index, (series_name, _) in enumerate(series_groups):
+            region_start = template_start + index * (template_height + 2)
+            region_end = region_start + template_height - 1
+            rename_series_block_titles(ws, series_name, region_start, region_end)
+            regions[series_name] = (region_start, region_end)
+
+    for series_name, series_records in series_groups:
+        region_start, region_end = regions[series_name]
+        report.append(f"Серия {series_name}: строки {region_start}-{region_end} листа {sheet_name!r}.")
+
+        series_report = append_measurement_blocks(
+            ws,
+            series_records,
+            ascii_record,
+            bindings,
+            region_start,
+            region_end,
+        )
+        report.extend(f"{series_name}: {line}" for line in series_report)
+    return report
+
+
+def fill_workbook_measurements_by_series_folders(
+    workbook,
+    sheet_name: str,
+    record_groups: list[tuple[str, list[RwdRecord]]],
+    ascii_record: AsciiRecord,
+    bindings: list[ChannelBinding],
+) -> list[str]:
+    ws = workbook[sheet_name]
+    series_names = [series_name for series_name, _ in record_groups]
+    regions = existing_series_regions(ws, series_names)
+    missing = [series_name for series_name in series_names if series_name not in regions]
+    if missing:
+        raise RuntimeError(
+            "В Excel-шаблоне не найдены отдельные секции для серий: "
+            + ", ".join(missing)
+            + ". Проверьте, что на листе input_data есть заголовки вида D31_U=0v_30_points."
+        )
+
+    report: list[str] = [
+        f"Режим папок серий: каждая папка записывается отдельно на лист {sheet_name!r}."
+    ]
+    for series_name, records in record_groups:
+        region_start, region_end = regions[series_name]
+        report.append(
+            f"Серия {series_name}: {len(records)} .rwd, строки {region_start}-{region_end} листа {sheet_name!r}."
+        )
+        series_report = append_measurement_blocks(
+            ws,
+            records,
+            ascii_record,
+            bindings,
+            region_start,
+            region_end,
+        )
+        report.extend(f"{series_name}: {line}" for line in series_report)
+    return report
 
 
 def output_path_for(template: Path, requested: Path | None) -> Path:
@@ -1389,8 +2108,10 @@ def interactive_args() -> argparse.Namespace:
     )
     rwd_paths = prompt_rwd_inputs()
     recursive = prompt_yes_no("Искать .rwd во вложенных папках?", default=False)
+    series_folders = prompt_yes_no("Обрабатывать папки d31/d33/d35 как отдельные серии?", default=False)
     sheet = prompt_line("4. Укажите лист, куда писать данные", "input_data")
     output = prompt_output_path(template)
+    include_ascii_data = prompt_yes_no("Использовать ASCII также как источник данных?", default=False)
     include_diagnostics = prompt_yes_no("Добавить диагностический лист raw_values?", default=False)
     return argparse.Namespace(
         template=template,
@@ -1399,7 +2120,12 @@ def interactive_args() -> argparse.Namespace:
         sheet=sheet,
         output=output,
         recursive=recursive,
+        series_folders=series_folders,
+        include_ascii_data=include_ascii_data,
+        data_ascii=[],
+        target_series=None,
         include_diagnostics=include_diagnostics,
+        allow_duplicates=False,
     )
 
 
@@ -1413,33 +2139,122 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--sheet", required=True, help="Название листа Excel, в который добавляются группы данных.")
     parser.add_argument("-o", "--output", type=Path, help="Путь к новой итоговой книге .xlsx.")
     parser.add_argument("-r", "--recursive", action="store_true", help="Искать .rwd во вложенных папках.")
+    parser.add_argument(
+        "--series-folders",
+        action="store_true",
+        help="Обрабатывать вложенные папки d31/d33/d35 как отдельные серии и писать каждую в свою секцию шаблона.",
+    )
+    parser.add_argument(
+        "--include-ascii-data",
+        action="store_true",
+        help=(
+            "Использовать переданный ASCII не только как структуру, но и как источник "
+            "измерений для отсутствующего блока."
+        ),
+    )
+    parser.add_argument(
+        "--data-ascii",
+        action="append",
+        default=[],
+        type=Path,
+        help="Дополнительный ASCII-файл, из которого нужно явно перенести строки измерений.",
+    )
     parser.add_argument("--include-diagnostics", action="store_true", help="Добавить технический лист raw_values.")
+    parser.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help="Не останавливать импорт, если на input_data найдены одинаковые числовые блоки.",
+    )
     return parser.parse_args(argv)
 
 
-def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path, list[Path]]:
+def parse_series_command_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Заполнить одну серию из отдельной папки в общем Excel-отчете."
+    )
+    parser.add_argument("command", choices=["series"], help=argparse.SUPPRESS)
+    parser.add_argument("series", help="Название серии: d31, d33, d35 или другое имя папки серии.")
+    parser.add_argument("--template", required=True, type=Path, help="Исходная Excel-книга для этого шага.")
+    parser.add_argument("--ascii", required=True, type=Path, help="ASCII-файл структуры RheoWin.")
+    parser.add_argument("--input-root", required=True, type=Path, help="Корневая папка, внутри которой лежит папка серии.")
+    parser.add_argument("-o", "--output", required=True, type=Path, help="Итоговая Excel-книга.")
+    parser.add_argument("--sheet", default="input_data", help="Лист для записи данных.")
+    parser.add_argument(
+        "--data-ascii",
+        action="append",
+        default=[],
+        type=Path,
+        help="ASCII-файл этой серии, из которого нужно явно перенести строки измерений.",
+    )
+    parser.add_argument("--include-diagnostics", action="store_true", help="Добавить технический лист raw_values.")
+    parser.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help="Не останавливать импорт, если на input_data найдены одинаковые числовые блоки.",
+    )
+    parsed = parser.parse_args(argv)
+
+    series = parsed.series.lower()
+    return argparse.Namespace(
+        template=parsed.template,
+        ascii=parsed.ascii,
+        rwd=[parsed.input_root / series],
+        sheet=parsed.sheet,
+        output=parsed.output,
+        recursive=True,
+        series_folders=False,
+        include_ascii_data=False,
+        data_ascii=parsed.data_ascii,
+        target_series=series.upper(),
+        include_diagnostics=parsed.include_diagnostics,
+        allow_duplicates=parsed.allow_duplicates,
+    )
+
+
+def validate_inputs(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, list[Path], list[tuple[str, list[Path]]] | None]:
     template = args.template.expanduser().resolve()
     ascii_path = args.ascii.expanduser().resolve()
     if not template.is_file() or template.suffix.lower() != ".xlsx":
         raise RuntimeError("Первым аргументом должен быть существующий Excel-шаблон .xlsx.")
     if not ascii_path.is_file() or ascii_path.suffix.lower() not in ASCII_SUFFIXES:
         raise RuntimeError("Вторым аргументом должен быть существующий ASCII-файл .txt, .asc или .csv.")
-    rwd_files = collect_rwd_files(args.rwd, recursive=args.recursive)
+    series_path_groups = None
+    if getattr(args, "series_folders", False):
+        series_path_groups = collect_series_folder_file_groups(args.rwd, recursive=args.recursive)
+        rwd_files = [file for _, files in series_path_groups for file in files]
+    else:
+        rwd_files = collect_rwd_files(args.rwd, recursive=args.recursive)
     if not rwd_files:
         raise RuntimeError("Не найдены .rwd файлы для обработки.")
-    return template, ascii_path, rwd_files
+    return template, ascii_path, rwd_files, series_path_groups
 
 
 def main(argv: list[str] | None = None) -> int:
     timer = StepTimer()
     try:
         argv = sys.argv[1:] if argv is None else argv
-        args = interactive_args() if not argv else parse_args(argv)
-        template, ascii_path, rwd_files = validate_inputs(args)
+        if not argv:
+            args = interactive_args()
+        elif argv[0].lower() == "series":
+            args = parse_series_command_args(argv)
+        else:
+            args = parse_args(argv)
+        template, ascii_path, rwd_files, series_path_groups = validate_inputs(args)
         timer.mark("Валидация входных путей")
         ascii_record = extract_ascii_record(ascii_path)
         timer.mark("Чтение ASCII-структуры")
         records = [extract_rwd_record(path) for path in rwd_files]
+        records_by_path = {record.path.resolve(): record for record in records}
+        record_groups = (
+            [
+                (series_name, [records_by_path[file.resolve()] for file in files])
+                for series_name, files in series_path_groups
+            ]
+            if series_path_groups is not None
+            else None
+        )
         timer.mark("Чтение .rwd файлов")
         bindings = build_structural_bindings(ascii_record, records)
         timer.mark("Построение структурной карты")
@@ -1450,11 +2265,51 @@ def main(argv: list[str] | None = None) -> int:
                 f"В шаблоне нет листа {args.sheet!r}. Доступные листы: {', '.join(workbook.sheetnames)}"
             )
         timer.mark("Загрузка Excel-шаблона")
-        fill_report = append_measurement_blocks(workbook[args.sheet], records, ascii_record, bindings)
+        if record_groups is not None:
+            fill_report = fill_workbook_measurements_by_series_folders(
+                workbook,
+                args.sheet,
+                record_groups,
+                ascii_record,
+                bindings,
+            )
+        else:
+            fill_report = fill_workbook_measurements(workbook, args.sheet, records, ascii_record, bindings)
+        if args.include_ascii_data:
+            fill_report.extend(
+                fill_ascii_data_into_workbook(
+                    workbook,
+                    args.sheet,
+                    ascii_record,
+                    record_groups,
+                    getattr(args, "target_series", None),
+                )
+            )
+        for data_ascii_path in getattr(args, "data_ascii", []):
+            data_ascii_record = extract_ascii_record(data_ascii_path.expanduser().resolve())
+            fill_report.extend(
+                fill_ascii_data_into_workbook(
+                    workbook,
+                    args.sheet,
+                    data_ascii_record,
+                    record_groups,
+                    getattr(args, "target_series", None),
+                )
+            )
+        duplicate_groups = validate_no_input_duplicates(
+            workbook,
+            args.sheet,
+            getattr(args, "allow_duplicates", False),
+        )
+        if duplicate_groups:
+            fill_report.append(
+                f"ВНИМАНИЕ: найдено групп повторяющихся числовых блоков: {len(duplicate_groups)}"
+            )
         update_metadata_sheet(workbook, records)
         write_mapping_sheet(workbook, ascii_record, bindings)
         if args.include_diagnostics:
             write_diagnostics_sheet(workbook, records)
+        clear_report_freeze_panes(workbook)
         timer.mark("Заполнение Excel-книги")
 
         output = output_path_for(template, args.output)
