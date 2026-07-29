@@ -18,6 +18,7 @@ output/parser_timer_check.xlsx
 
 # Локальные экспериментальные наборы данных.
 input/06_june_proj/
+input/07_july_proj/
 input/D_series/
 input/SCTNA_60_PyrO_40_Katal68_2/
 input/SCTNA_60_PyrO_40_Katal68_3/

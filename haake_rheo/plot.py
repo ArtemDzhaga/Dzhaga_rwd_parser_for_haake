@@ -195,6 +195,9 @@ def interactive_args() -> argparse.Namespace:
     frequencies = [value.strip() for value in re.split(r"[\s,;]+", raw_frequencies) if value.strip()] or None
     no_fit = prompt_yes_no("Отключить полиномиальные кривые?", default=False)
     legend_columns = prompt_int("Количество столбцов легенды", 1, 1)
+    split_by_series = prompt_yes_no("Разделить графики по сериям?", default=False)
+    raw_series = prompt_line("Серии через пробел, пусто = все", "") if split_by_series else ""
+    series = [value.strip() for value in re.split(r"[\s,;]+", raw_series) if value.strip()] or None
     dpi = prompt_int("DPI для PNG", 300, 72)
     return argparse.Namespace(
         workbook=workbook,
@@ -209,6 +212,8 @@ def interactive_args() -> argparse.Namespace:
         dpi=dpi,
         legend_columns=legend_columns,
         no_fit=no_fit,
+        split_by_series=split_by_series,
+        series=series,
         allow_duplicates=False,
     )
 
@@ -276,6 +281,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Не рисовать полиномиальную сглаживающую линию.",
     )
     parser.add_argument(
+        "--split-by-series",
+        action="store_true",
+        help="Строить отдельные наборы графиков для каждой серии, например D31, D33, D35.",
+    )
+    parser.add_argument(
+        "--series",
+        nargs="+",
+        help="Ограничить серии для --split-by-series, например: --series D31 D33 D35.",
+    )
+    parser.add_argument(
         "--allow-duplicates",
         action="store_true",
         help="Не останавливать построение, если на output_data найдены одинаковые серии.",
@@ -301,8 +316,14 @@ def as_float(value) -> float | None:
     return None
 
 
-CELL_REF_RE = re.compile(r"^=?(?:IF\()?([A-Za-z_][A-Za-z0-9_ ]*)!([A-Z]+)([0-9]+)")
+CELL_REF_RE = re.compile(
+    r"^=?(?:IF\()?'?([A-Za-z_][A-Za-z0-9_ ]*)'?!([A-Z]+)([0-9]+)"
+)
 DIRECT_CELL_RE = re.compile(r"^=?([A-Z]+)([0-9]+)$")
+DIVISION_REF_RE = re.compile(
+    r"^=IFERROR\('?([A-Za-z_][A-Za-z0-9_ ]*)'?!([A-Z]+)([0-9]+)"
+    r"/'?([A-Za-z_][A-Za-z0-9_ ]*)'?!([A-Z]+)([0-9]+),"
+)
 
 
 def column_index(column_letters: str) -> int:
@@ -331,6 +352,33 @@ def cell_numeric_value(workbook, ws, row: int, column: int) -> float | None:
         source_ws = workbook[sheet_name]
         source_value = source_ws.cell(int(row_text), column_index(column_letters)).value
         return as_float(source_value)
+    division_match = DIVISION_REF_RE.match(formula)
+    if division_match:
+        (
+            numerator_sheet,
+            numerator_column,
+            numerator_row,
+            denominator_sheet,
+            denominator_column,
+            denominator_row,
+        ) = division_match.groups()
+        if numerator_sheet not in workbook.sheetnames or denominator_sheet not in workbook.sheetnames:
+            return None
+        numerator = as_float(
+            workbook[numerator_sheet].cell(
+                int(numerator_row),
+                column_index(numerator_column),
+            ).value
+        )
+        denominator = as_float(
+            workbook[denominator_sheet].cell(
+                int(denominator_row),
+                column_index(denominator_column),
+            ).value
+        )
+        if numerator is None or denominator in (None, 0):
+            return None
+        return numerator / denominator
     direct_match = DIRECT_CELL_RE.match(formula)
     if direct_match:
         column_letters, row_text = direct_match.groups()
@@ -732,15 +780,45 @@ def fitted_curve(
     order: int,
     curve_points: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    load_plot_dependencies()
     if len(xs) < 3:
         return np.array([]), np.array([])
-    effective_order = min(max(order, 1), len(xs) - 1)
-    log_xs = np.log10(xs)
-    log_ys = np.log10(ys)
-    coefficients = np.polyfit(log_xs, log_ys, effective_order)
-    curve_log_xs = np.linspace(float(log_xs.min()), float(log_xs.max()), curve_points)
-    curve_log_ys = np.polyval(coefficients, curve_log_xs)
-    return np.power(10.0, curve_log_xs), np.power(10.0, curve_log_ys)
+    finite = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
+    log_xs = np.log10(xs[finite])
+    log_ys = np.log10(ys[finite])
+    if len(log_xs) < 3:
+        return np.array([]), np.array([])
+
+    unique_xs, inverse = np.unique(log_xs, return_inverse=True)
+    if len(unique_xs) < 3:
+        return np.array([]), np.array([])
+    unique_ys = np.array(
+        [np.median(log_ys[inverse == index]) for index in range(len(unique_xs))],
+        dtype=float,
+    )
+    center = float((unique_xs.min() + unique_xs.max()) / 2)
+    scale = float((unique_xs.max() - unique_xs.min()) / 2)
+    if scale <= 0:
+        return np.array([]), np.array([])
+
+    normalized_xs = (unique_xs - center) / scale
+    curve_log_xs = np.linspace(float(unique_xs.min()), float(unique_xs.max()), curve_points)
+    curve_normalized_xs = (curve_log_xs - center) / scale
+    max_order = min(max(order, 1), len(unique_xs) - 1)
+    margin = 0.3
+    lower_bound = float(unique_ys.min() - margin)
+    upper_bound = float(unique_ys.max() + margin)
+
+    for effective_order in range(max_order, 0, -1):
+        coefficients = np.polyfit(normalized_xs, unique_ys, effective_order)
+        curve_log_ys = np.polyval(coefficients, curve_normalized_xs)
+        if (
+            np.all(np.isfinite(curve_log_ys))
+            and float(curve_log_ys.min()) >= lower_bound
+            and float(curve_log_ys.max()) <= upper_bound
+        ):
+            return np.power(10.0, curve_log_xs), np.power(10.0, curve_log_ys)
+    return np.array([]), np.array([])
 
 
 def grouped_by_frequency(series: Iterable[SeriesData]) -> dict[float, list[SeriesData]]:
@@ -748,6 +826,34 @@ def grouped_by_frequency(series: Iterable[SeriesData]) -> dict[float, list[Serie
     for item in series:
         groups.setdefault(item.frequency_hz, []).append(item)
     return groups
+
+
+def series_group_name(item: SeriesData) -> str:
+    label = item.label.strip()
+    d_series_match = re.match(r"^(D\d+)(?:_|$)", label, re.IGNORECASE)
+    if d_series_match:
+        return d_series_match.group(1).upper()
+    without_voltage = re.sub(r"_\d+v$", "", label, flags=re.IGNORECASE).strip("_")
+    return without_voltage or "series"
+
+
+def safe_path_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._=-]+", "_", value.strip())
+    return cleaned.strip("._") or "series"
+
+
+def legend_label(item: SeriesData, series_name: str | None) -> str:
+    if series_name:
+        prefix = f"{series_name}_"
+        if item.label.lower().startswith(prefix.lower()):
+            return item.label[len(prefix) :]
+    return item.label
+
+
+def selected_series_names(values: list[str] | None) -> set[str] | None:
+    if not values:
+        return None
+    return {value.strip().upper() for value in values if value.strip()}
 
 
 def duplicate_value(value: float | None) -> float | None:
@@ -822,6 +928,7 @@ def plot_metric(
     curve_points: int,
     draw_fit: bool,
     legend_columns: int,
+    series_name: str | None = None,
 ) -> list[Path]:
     metric_info = METRICS[metric]
     fig, ax = plt.subplots(figsize=(7.2, 8.6), dpi=dpi)
@@ -840,7 +947,7 @@ def plot_metric(
             color=style["color"],
             edgecolor=style["color"],
             linewidths=0.8,
-            label=item.label,
+            label=legend_label(item, series_name),
             zorder=3,
         )
         if draw_fit:
@@ -866,7 +973,11 @@ def plot_metric(
     ax.set_box_aspect(1)
     ax.set_xlabel(f"Gamma {frequency_label.replace(' ', '')}", fontsize=13, fontweight="bold")
     ax.set_ylabel(f"{metric_info['ylabel']} {frequency_label.replace(' ', '')}", fontsize=13, fontweight="bold")
-    ax.set_title(f"{metric_info['title']} | {frequency_label}", fontsize=12, fontweight="bold")
+    title_parts = [metric_info["title"]]
+    if series_name:
+        title_parts.append(series_name)
+    title_parts.append(frequency_label)
+    ax.set_title(" | ".join(title_parts), fontsize=12, fontweight="bold")
     ax.grid(True, which="major", linestyle=":", linewidth=1.0, color="#B8B8B8", alpha=0.9)
     ax.grid(True, which="minor", linestyle=":", linewidth=0.7, color="#D0D0D0", alpha=0.75)
     ax.tick_params(axis="both", which="major", direction="in", top=True, right=True, length=7, width=1.1)
@@ -914,6 +1025,8 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("--curve-points должен быть не меньше 20.")
     if args.legend_columns < 1:
         raise RuntimeError("--legend-columns должен быть больше 0.")
+    if args.series and not args.split_by_series:
+        raise RuntimeError("--series используется только вместе с --split-by-series.")
     timer.mark("Валидация аргументов")
 
     load_plot_dependencies()
@@ -924,26 +1037,44 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(format_duplicate_series(duplicate_groups))
     timer.mark("Чтение данных Excel")
     frequency_filter = selected_frequencies(args.frequencies)
+    series_filter = selected_series_names(args.series)
     groups = grouped_by_frequency(series)
     saved: list[Path] = []
     for frequency_hz, frequency_series in sorted(groups.items()):
         if frequency_filter is not None and round(frequency_hz, 10) not in frequency_filter:
             continue
-        for metric in args.metrics:
-            saved.extend(
-                plot_metric(
-                    frequency_hz,
-                    frequency_series,
-                    metric,
-                    args.output_dir,
-                    args.formats,
-                    args.dpi,
-                    args.poly_order,
-                    args.curve_points,
-                    not args.no_fit,
-                    args.legend_columns,
-                )
+        if args.split_by_series:
+            grouped_series: dict[str, list[SeriesData]] = {}
+            for item in frequency_series:
+                grouped_series.setdefault(series_group_name(item), []).append(item)
+        else:
+            grouped_series = {"": frequency_series}
+        for series_name, plot_series in sorted(grouped_series.items()):
+            visible_series_name = series_name or None
+            if series_filter is not None and visible_series_name is not None:
+                if visible_series_name.upper() not in series_filter:
+                    continue
+            target_output_dir = (
+                args.output_dir / safe_path_component(series_name)
+                if args.split_by_series and series_name
+                else args.output_dir
             )
+            for metric in args.metrics:
+                saved.extend(
+                    plot_metric(
+                        frequency_hz,
+                        plot_series,
+                        metric,
+                        target_output_dir,
+                        args.formats,
+                        args.dpi,
+                        args.poly_order,
+                        args.curve_points,
+                        not args.no_fit,
+                        args.legend_columns,
+                        visible_series_name,
+                    )
+                )
 
     if not saved:
         raise RuntimeError("Не построено ни одного графика: проверьте лист, частоты и данные.")

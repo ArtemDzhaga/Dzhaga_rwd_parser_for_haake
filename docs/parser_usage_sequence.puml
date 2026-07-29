@@ -21,12 +21,13 @@ ParserCli -> Rwd: Найти и прочитать .rwd
 loop Для каждого .rwd
   ParserCli -> ParserCli: Разобрать имя эксперимента\nсостав, U, freq
   ParserCli -> ParserCli: Сопоставить бинарные каналы\nс ASCII-структурой
-  ParserCli -> ParserCli: Найти фактические частотные\nсегменты по f in Hz
+  ParserCli -> ParserCli: Найти частотные сегменты\nи привести их к общей сетке
+  ParserCli -> ParserCli: Взять состав и напряжение\nиз имени .rwd
   ParserCli -> ParserCli: Округлить измерения как RheoWin\nдо 4 значащих цифр
   ParserCli -> Workbook: Записать точки в input_data
 end
 
-ParserCli -> Workbook: Обновить output_data формулами шаблона
+ParserCli -> Workbook: Пересобрать output_data\nдля первых 20 точек
 ParserCli -> ParserCli: Проверить input_data\nна повторяющиеся блоки
 
 alt Дубли найдены

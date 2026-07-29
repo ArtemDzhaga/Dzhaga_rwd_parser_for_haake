@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import re
 import shlex
 import struct
@@ -125,6 +126,22 @@ class ChannelBinding:
     block_key: tuple[int, int, int] | None = None
     block_occurrence: int = 0
     segment_stride: int = 0
+
+
+@dataclass(frozen=True)
+class CsvChannelBinding:
+    header: str
+    block_key: tuple[int, int, int]
+    block_occurrence: int = 0
+    transform: str = "raw"
+
+
+@dataclass(frozen=True)
+class CsvRowSegment:
+    label: str
+    start_index: int
+    row_count: int
+    byte_offset: int
 
 
 @dataclass(frozen=True)
@@ -414,6 +431,21 @@ def format_frequency_token(frequency: float) -> str:
     return f"{text}hz"
 
 
+STANDARD_FREQUENCIES = (0.1, 0.5, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0)
+
+
+def standardize_frequency(frequency: float) -> float:
+    nearest = min(STANDARD_FREQUENCIES, key=lambda candidate: abs(candidate - frequency))
+    if math.isclose(nearest, frequency, rel_tol=0.05, abs_tol=0.05):
+        return nearest
+    return frequency
+
+
+def format_frequency_heading(frequency: float) -> str:
+    standardized = standardize_frequency(frequency)
+    return f"Частота {standardized:g} Гц".replace(".", ",")
+
+
 def ascii_segments(ascii_record: AsciiRecord) -> list[AsciiSegment]:
     frequency_index = frequency_column_index(ascii_record)
     segments: list[AsciiSegment] = []
@@ -516,6 +548,130 @@ STRUCTURAL_CHANNELS = {
         "f in Hz": ((35, 0, 4), 0),
     }.items()
 }
+
+
+CSV_CHANNELS = {
+    normalize_header(header): CsvChannelBinding(header, key, occurrence, transform)
+    for header, key, occurrence, transform in [
+        ("GP in 1/s", (3, 0, 4), 0, "raw"),
+        ("Tau in Pa", (2, 0, 4), 0, "raw"),
+        ("Eta in Pas", (17, 0, 4), 0, "raw"),
+        ("T in °C", (4, 200, 4), 0, "kelvin_to_celsius"),
+        ("T in C", (4, 200, 4), 0, "kelvin_to_celsius"),
+        ("t in s", (7, 4, 4), 0, "raw"),
+        ("t_seg in s", (7, 5, 4), 0, "raw"),
+        ("Gamma in -", (16, 0, 4), 0, "raw"),
+        ("|Eta*| in Pas", (17, 3, 4), 0, "raw"),
+        ("G' in Pa", (21, 1, 4), 0, "raw"),
+        ('G" in Pa', (21, 2, 4), 0, "raw"),
+        ("f in Hz", (35, 0, 4), 0, "raw"),
+    ]
+}
+
+
+def transform_csv_channel_value(value: float, transform: str) -> float:
+    if transform == "kelvin_to_celsius" and math.isfinite(value):
+        return value - 273.15
+    return value
+
+
+def block_float_capacity(record: RwdRecord, block: NumericBlock) -> int:
+    next_marker = record.blob.find(NUMERIC_RECORD_MARKER, block.data_offset)
+    data_end = next_marker if next_marker > block.data_offset else len(record.blob)
+    return max(0, (data_end - block.data_offset) // 4)
+
+
+def block_byte_capacity(record: RwdRecord, block: NumericBlock) -> int:
+    next_marker = record.blob.find(NUMERIC_RECORD_MARKER, block.data_offset)
+    data_end = next_marker if next_marker > block.data_offset else len(record.blob)
+    return max(0, data_end - block.data_offset)
+
+
+def ascii_row_segments_for_csv(ascii_record: AsciiRecord) -> list[CsvRowSegment]:
+    segments: list[CsvRowSegment] = []
+    current_label = ""
+    current_start = 0
+    current_byte_offset = 0
+
+    def add_segment(label: str, start_index: int, end_index: int, byte_offset: int) -> None:
+        segments.append(
+            CsvRowSegment(
+                label=label,
+                start_index=start_index,
+                row_count=end_index - start_index,
+                byte_offset=byte_offset,
+            )
+        )
+
+    for index, label in enumerate(ascii_record.row_labels):
+        segment_label = label.split("|", 1)[0] if "|" in label else "1"
+        if index == 0:
+            current_label = segment_label
+            current_start = 0
+            current_byte_offset = 0
+            continue
+        if segment_label != current_label:
+            add_segment(current_label, current_start, index, current_byte_offset)
+            current_byte_offset += (index - current_start) * 4 + 18
+            current_label = segment_label
+            current_start = index
+    add_segment(current_label or "1", current_start, len(ascii_record.rows), current_byte_offset)
+    return segments
+
+
+def csv_required_byte_span(ascii_record: AsciiRecord) -> int:
+    segments = ascii_row_segments_for_csv(ascii_record)
+    if not segments:
+        return 0
+    last = segments[-1]
+    return last.byte_offset + last.row_count * 4
+
+
+def read_block_float_values(
+    record: RwdRecord,
+    block: NumericBlock,
+    row_count: int,
+    transform: str = "raw",
+    start_offset: int | None = None,
+) -> list[float]:
+    data_offset = block.data_offset if start_offset is None else start_offset
+    if data_offset + row_count * 4 > len(record.blob):
+        raise RuntimeError(
+            f"Файл {record.path.name}: канал {block.key} не содержит "
+            f"{row_count} значений начиная со смещения {hex(data_offset)}."
+        )
+    values: list[float] = []
+    for index in range(row_count):
+        raw_value = struct.unpack_from("<f", record.blob, data_offset + index * 4)[0]
+        values.append(transform_csv_channel_value(raw_value, transform))
+    return values
+
+
+def csv_channel_bindings(ascii_record: AsciiRecord, record: RwdRecord) -> list[CsvChannelBinding]:
+    bindings: list[CsvChannelBinding] = []
+    missing_headers: list[str] = []
+    missing_blocks: list[str] = []
+    for header in ascii_record.headers[1:]:
+        binding = CSV_CHANNELS.get(normalize_header(header))
+        if binding is None:
+            missing_headers.append(header)
+            continue
+        block = nth_numeric_block(record, binding.block_key, binding.block_occurrence)
+        if block is None:
+            missing_blocks.append(f"{header} -> {binding.block_key}")
+            continue
+        bindings.append(binding)
+    if missing_headers:
+        raise RuntimeError(
+            "Для CSV-экспорта пока нет сопоставления бинарных каналов для колонок: "
+            + ", ".join(missing_headers)
+        )
+    if missing_blocks:
+        raise RuntimeError(
+            f"Файл {record.path.name}: не найдены ожидаемые бинарные каналы: "
+            + ", ".join(missing_blocks)
+        )
+    return bindings
 
 
 def build_structural_bindings(ascii_record: AsciiRecord, records: list[RwdRecord]) -> list[ChannelBinding]:
@@ -908,6 +1064,12 @@ def voltage_folder_hint(path: Path) -> str | None:
     return None
 
 
+def experiment_series_name_from_path(path: Path, identity: ExperimentIdentity | None = None) -> str:
+    if re.fullmatch(r"\d+v", path.parent.name, re.I):
+        return path.parent.parent.name
+    return experiment_series_name_from_identity(identity or parse_experiment_identity(path))
+
+
 def rwd_preference_key(path: Path) -> tuple[int, int, str]:
     name = path.stem.lower()
     return (
@@ -930,8 +1092,10 @@ def normalize_collected_rwd_files(files: list[Path]) -> list[Path]:
             skipped_voltage_mismatch.append(f"{file.name} ({folder_voltage} folder, {identity.voltage} in name)")
             continue
 
-        frequency_key: float | str = "__batch__" if identity.is_batch else float(identity.frequency_sort_key)
-        duplicate_key = (experiment_series_name_from_identity(identity).lower(), file_voltage, frequency_key)
+        frequency_key: float | str = (
+            identity.frequency.lower() if identity.is_batch else float(identity.frequency_sort_key)
+        )
+        duplicate_key = (experiment_series_name_from_path(file, identity).lower(), file_voltage, frequency_key)
         current = selected.get(duplicate_key)
         if current is None or rwd_preference_key(file) > rwd_preference_key(current):
             if current is not None:
@@ -991,9 +1155,43 @@ def parse_experiment_identity(path: Path) -> ExperimentIdentity:
     )
 
 
+def embedded_record_voltage(record: RwdRecord) -> str | None:
+    path_identity = parse_experiment_identity(record.path)
+    path_series = experiment_series_name_from_identity(path_identity).lower()
+    voltages: set[str] = set()
+    for _, text in record.strings:
+        for match in re.finditer(r"[^\\/\s]+\.rwd", text, re.I):
+            try:
+                identity = parse_experiment_identity(Path(match.group(0)))
+            except RuntimeError:
+                continue
+            if experiment_series_name_from_identity(identity).lower() == path_series:
+                voltage_value = identity.voltage.lower().removeprefix("u=")
+                voltages.add(f"U={voltage_value}")
+    return next(iter(voltages)) if len(voltages) == 1 else None
+
+
+def record_experiment_identity(record: RwdRecord) -> ExperimentIdentity:
+    return parse_experiment_identity(record.path)
+
+
+def record_identity_notes(records: list[RwdRecord]) -> list[str]:
+    notes: list[str] = []
+    for record in records:
+        path_identity = parse_experiment_identity(record.path)
+        embedded_voltage = embedded_record_voltage(record)
+        if embedded_voltage and path_identity.voltage.lower() != embedded_voltage.lower():
+            notes.append(
+                f"ВНИМАНИЕ: {record.path.name}: имя файла содержит {path_identity.voltage}, "
+                f"а внутренние служебные пути RheoWin содержат {embedded_voltage}; "
+                "использовано значение из имени файла."
+            )
+    return notes
+
+
 def experiment_series_name(record: RwdRecord) -> str:
-    identity = parse_experiment_identity(record.path)
-    return experiment_series_name_from_identity(identity)
+    identity = record_experiment_identity(record)
+    return experiment_series_name_from_path(record.path, identity)
 
 
 def experiment_series_name_from_identity(identity: ExperimentIdentity) -> str:
@@ -1037,7 +1235,7 @@ def group_records_by_series(records: list[RwdRecord]) -> list[tuple[str, list[Rw
 
 
 def measurement_source_sort_key(record: RwdRecord) -> tuple[str, str, int, int, str]:
-    identity = parse_experiment_identity(record.path)
+    identity = record_experiment_identity(record)
     voltage = identity.voltage.removeprefix("U=").lower()
     name = record.path.stem.lower()
     return (
@@ -1053,10 +1251,10 @@ def group_records(records: list[RwdRecord]) -> list[tuple[str, list[tuple[Experi
     grouped: dict[str, list[tuple[ExperimentIdentity, RwdRecord]]] = {}
     seen: set[tuple[str, str]] = set()
     for record in records:
-        identity = parse_experiment_identity(record.path)
+        identity = record_experiment_identity(record)
         duplicate_key = (
             identity.block_name.lower(),
-            "__batch__" if identity.is_batch else identity.frequency.lower(),
+            identity.frequency.lower(),
         )
         if duplicate_key in seen:
             raise RuntimeError(
@@ -1297,7 +1495,7 @@ def fill_template_measurement_blocks(
     written_by_voltage: dict[str, set[float]] = {}
     report: list[str] = []
     for record in sorted(records, key=measurement_source_sort_key):
-        identity = parse_experiment_identity(record.path)
+        identity = record_experiment_identity(record)
         record_bindings = adapt_bindings_to_record(bindings, record)
         selected_bindings = display_bindings(record_bindings)
         voltage = identity.voltage.removeprefix("U=").lower()
@@ -1315,10 +1513,11 @@ def fill_template_measurement_blocks(
         for ascii_segment_index, record_segment_index, segment, matched_row_count in record_segments:
             if segment.frequency_sort_key is None:
                 raise RuntimeError(f"Не удалось определить частоту для файла {record.path.name!r}.")
-            duplicate_key = (voltage, segment.frequency_sort_key)
+            output_frequency = standardize_frequency(segment.frequency_sort_key)
+            duplicate_key = (voltage, output_frequency)
             if duplicate_key in seen:
                 frequency_notes.append(
-                    f"{segment.frequency_sort_key:g} Гц: повторный источник {record.path.name} пропущен"
+                    f"{output_frequency:g} Гц: повторный источник {record.path.name} пропущен"
                 )
                 continue
             frequency_note = validate_record_frequency(
@@ -1334,7 +1533,7 @@ def fill_template_measurement_blocks(
 
             frequency_start_column = find_frequency_column(
                 template_frequency_columns(ws, block_row),
-                segment.frequency_sort_key,
+                output_frequency,
             )
             rows = extract_signed_rows(
                 record,
@@ -1360,9 +1559,9 @@ def fill_template_measurement_blocks(
                 ws.cell(block_row + row_offset, frequency_start_column - 1, values[0])
                 for column_offset, value in enumerate(values[1:]):
                     ws.cell(block_row + row_offset, frequency_start_column + column_offset, value)
-            written_frequencies.append(segment.frequency_sort_key)
-            written_by_voltage.setdefault(voltage, set()).add(segment.frequency_sort_key)
-            segment_counts.append((segment.frequency_sort_key, matched_row_count, segment.row_count))
+            written_frequencies.append(output_frequency)
+            written_by_voltage.setdefault(voltage, set()).add(output_frequency)
+            segment_counts.append((output_frequency, matched_row_count, segment.row_count))
         frequencies = ", ".join(f"{frequency:g} Гц" for frequency in sorted(written_frequencies)) or "нет записанных частот"
         report.append(
             f"{record.path.name}: блок {identity.voltage}, частоты: {frequencies}"
@@ -1441,13 +1640,14 @@ def fill_ascii_measurement_blocks(
     written: list[float] = []
     skipped: list[float] = []
     for segment in ascii_segments(ascii_record):
+        output_frequency = standardize_frequency(segment.frequency_sort_key)
         frequency_start_column = find_frequency_column(
             template_frequency_columns(ws, block_row),
-            segment.frequency_sort_key,
+            output_frequency,
         )
         first_value_cell = ws.cell(block_row + 3, frequency_start_column)
         if first_value_cell.value not in (None, ""):
-            skipped.append(segment.frequency_sort_key)
+            skipped.append(output_frequency)
             continue
         for row_offset in range(segment.row_count):
             values = ascii_row_values(
@@ -1459,7 +1659,7 @@ def fill_ascii_measurement_blocks(
             ws.cell(target_row, frequency_start_column - 1, values[0])
             for column_offset, value in enumerate(values[1:]):
                 ws.cell(target_row, frequency_start_column + column_offset, value)
-        written.append(segment.frequency_sort_key)
+        written.append(output_frequency)
 
     message = (
         f"ASCII-данные {ascii_record.path.name}: блок {identity.voltage}, "
@@ -1561,7 +1761,7 @@ def append_measurement_blocks(
             subblocks.extend(
                 (
                     segment.frequency_sort_key,
-                    segment.frequency_label,
+                    format_frequency_heading(segment.frequency_sort_key),
                     record,
                     record_bindings,
                     selected_bindings,
@@ -1578,9 +1778,19 @@ def append_measurement_blocks(
             )
 
         duplicate_frequencies = {
-            frequency
+            standardize_frequency(frequency)
             for frequency in [item[0] for item in subblocks]
-            if sum(1 for other in subblocks if math.isclose(other[0], frequency, rel_tol=1e-9, abs_tol=1e-9)) > 1
+            if sum(
+                1
+                for other in subblocks
+                if math.isclose(
+                    standardize_frequency(other[0]),
+                    standardize_frequency(frequency),
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+            )
+            > 1
         }
         if duplicate_frequencies:
             raise RuntimeError(
@@ -1601,8 +1811,9 @@ def append_measurement_blocks(
             row_count,
             segment_index,
         ) in enumerate(
-            sorted(subblocks, key=lambda item: item[0])
+            sorted(subblocks, key=lambda item: standardize_frequency(item[0]))
         ):
+            output_frequency = standardize_frequency(frequency)
             frequency_start_column = 1 + frequency_index * 7
             value_start_column = frequency_start_column + 1
             frequency_note = validate_record_frequency(
@@ -1629,7 +1840,7 @@ def append_measurement_blocks(
                 ws.cell(block_start_row + row_offset, frequency_start_column, row[0])
                 for column_offset, value in enumerate(row[1:]):
                     ws.cell(block_start_row + row_offset, value_start_column + column_offset, value)
-            written_subblock_frequencies.append(frequency)
+            written_subblock_frequencies.append(output_frequency)
 
             for row in (block_start_row + 1, block_start_row + 2):
                 for column in range(frequency_start_column, frequency_start_column + 7):
@@ -1647,7 +1858,7 @@ def append_measurement_blocks(
         notes = [
             filename_frequency_note(identity, [frequency])
             for frequency, _, record, _, _, _, _, _ in subblocks
-            for identity in [parse_experiment_identity(record.path)]
+            for identity in [record_experiment_identity(record)]
         ]
         report.append(
             f"Добавлен новый блок {block_name}: частоты: {report_frequencies}"
@@ -1916,6 +2127,206 @@ def existing_series_regions(ws, series_names: list[str]) -> dict[str, tuple[int,
     return regions
 
 
+def clear_measurement_region(ws, min_row: int, max_row: int) -> None:
+    for block_row in template_voltage_rows(ws, min_row, max_row).values():
+        for value_column in template_frequency_columns(ws, block_row).values():
+            for row in range(block_row + 3, min(block_row + 33, max_row + 1)):
+                for column in range(value_column - 1, value_column + 6):
+                    ws.cell(row, column).value = None
+
+
+def output_formula(sheet_name: str, coordinate: str) -> str:
+    reference = f"'{sheet_name}'!{coordinate}"
+    return f'=IF({reference}="","",{reference})'
+
+
+def output_ratio_formula(sheet_name: str, numerator: str, denominator: str) -> str:
+    return f'=IFERROR(\'{sheet_name}\'!{numerator}/\'{sheet_name}\'!{denominator},"")'
+
+
+def output_source_header(value: Any) -> str | None:
+    text = normalize_header(str(value or "")).replace("”", '"').replace("“", '"')
+    if "gamma" in text:
+        return "gamma"
+    if "|eta*|" in text or "eta" in text:
+        return "eta"
+    if 'g"' in text:
+        return "g_double_prime"
+    if "g'" in text:
+        return "g_prime"
+    return None
+
+
+def populated_input_sources(ws, points: int = 20) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for block_row in range(1, ws.max_row + 1):
+        title = ws.cell(block_row, 2).value
+        if not isinstance(title, str):
+            continue
+        match = re.match(r"(?P<series>.+?)_U=(?P<voltage>\d+)v_", title.strip(), re.I)
+        if match is None:
+            continue
+        series_name = match.group("series")
+        voltage = int(match.group("voltage"))
+        for frequency, first_column in template_frequency_columns(ws, block_row).items():
+            columns = {}
+            for column in range(first_column, first_column + 6):
+                key = output_source_header(ws.cell(block_row + 2, column).value)
+                if key is not None:
+                    columns[key] = column
+            required = {"gamma", "g_prime", "g_double_prime", "eta"}
+            if not required.issubset(columns):
+                continue
+            first_row = block_row + 3
+            if not any(
+                is_real_number(ws.cell(row, columns["gamma"]).value)
+                and is_real_number(ws.cell(row, columns["g_prime"]).value)
+                for row in range(first_row, first_row + points)
+            ):
+                continue
+            sources.append(
+                {
+                    "series": series_name,
+                    "voltage": voltage,
+                    "frequency": frequency,
+                    "first_row": first_row,
+                    "columns": columns,
+                }
+            )
+    return sorted(
+        sources,
+        key=lambda item: (
+            str(item["series"]).lower(),
+            int(item["voltage"]),
+            float(item["frequency"]),
+        ),
+    )
+
+
+def rebuild_output_data(workbook, input_sheet_name: str, points: int = 20) -> int:
+    if "output_data" not in workbook.sheetnames:
+        ws = workbook.create_sheet("output_data")
+    else:
+        ws = workbook["output_data"]
+        for merged_range in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(merged_range))
+        ws.delete_rows(1, ws.max_row)
+
+    input_ws = workbook[input_sheet_name]
+    sources = populated_input_sources(input_ws, points)
+    curves = sorted(
+        {(str(item["series"]), int(item["voltage"])) for item in sources},
+        key=lambda item: (item[0].lower(), item[1]),
+    )
+    frequencies = sorted({float(item["frequency"]) for item in sources})
+    source_by_key = {
+        (str(item["series"]), int(item["voltage"]), float(item["frequency"])): item
+        for item in sources
+    }
+
+    ws.cell(1, 1, "point")
+    ws.cell(1, 2, "f")
+    ws.cell(2, 2, "Hz")
+    metric_columns: dict[tuple[str, str, int], tuple[int, int]] = {}
+    current_column = 3
+    metric_headers = (
+        ("g_prime", "G'", "Pa"),
+        ("g_double_prime", 'G"', "Pa"),
+        ("eta", "|Eta*|", "Pa·s"),
+    )
+    for metric, value_header, unit in metric_headers:
+        for series_name, voltage in curves:
+            label = f"{series_name}_{voltage}v"
+            ws.cell(1, current_column, f"Gamma_{voltage}v")
+            ws.cell(1, current_column + 1, f"{value_header}_{voltage}v")
+            ws.cell(2, current_column + 1, unit)
+            ws.cell(3, current_column, label)
+            ws.cell(3, current_column + 1, label)
+            metric_columns[(metric, series_name, voltage)] = (current_column, current_column + 1)
+            current_column += 2
+        ws.cell(1, current_column, "----------")
+        current_column += 1
+
+    tan_columns: dict[tuple[str, int], int] = {}
+    for series_name, voltage in curves:
+        label = f"{series_name}_{voltage}v"
+        ws.cell(1, current_column, f"tan_delta_{voltage}v")
+        ws.cell(3, current_column, label)
+        tan_columns[(series_name, voltage)] = current_column
+        current_column += 1
+
+    header_fill = PatternFill("solid", fgColor="9FBAD0")
+    frequency_fill = PatternFill("solid", fgColor="FFF94A")
+    for row in (1, 2, 3):
+        for column in range(1, current_column):
+            cell = ws.cell(row, column)
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    output_row = 4
+    for frequency in frequencies:
+        frequency_text = f"{frequency:g}".replace(".", ",")
+        ws.cell(output_row, 1, f"Частота {frequency_text} Гц")
+        for column in range(1, current_column):
+            ws.cell(output_row, column).fill = frequency_fill
+            ws.cell(output_row, column).font = Font(bold=True)
+
+        for point_index in range(points):
+            row = output_row + 1 + point_index
+            ws.cell(row, 1, point_index + 1)
+            ws.cell(row, 2, frequency)
+            for series_name, voltage in curves:
+                source = source_by_key.get((series_name, voltage, frequency))
+                if source is None:
+                    continue
+                source_row = int(source["first_row"]) + point_index
+                columns = source["columns"]
+                gamma_coordinate = ws_cell_coordinate(
+                    source_row,
+                    int(columns["gamma"]),
+                )
+                value_coordinates = {
+                    "g_prime": ws_cell_coordinate(
+                        source_row,
+                        int(columns["g_prime"]),
+                    ),
+                    "g_double_prime": ws_cell_coordinate(
+                        source_row,
+                        int(columns["g_double_prime"]),
+                    ),
+                    "eta": ws_cell_coordinate(
+                        source_row,
+                        int(columns["eta"]),
+                    ),
+                }
+                for metric, value_coordinate in value_coordinates.items():
+                    gamma_column, value_column = metric_columns[(metric, series_name, voltage)]
+                    ws.cell(row, gamma_column, output_formula(input_sheet_name, gamma_coordinate))
+                    ws.cell(row, value_column, output_formula(input_sheet_name, value_coordinate))
+                ws.cell(
+                    row,
+                    tan_columns[(series_name, voltage)],
+                    output_ratio_formula(
+                        input_sheet_name,
+                        value_coordinates["g_double_prime"],
+                        value_coordinates["g_prime"],
+                    ),
+                )
+        output_row += points + 2
+
+    ws.freeze_panes = None
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 10
+    for column in range(3, current_column):
+        ws.column_dimensions[get_column_letter(column)].width = 18
+    return len(sources)
+
+
+def ws_cell_coordinate(row: int, column: int) -> str:
+    return f"{get_column_letter(column)}{row}"
+
+
 def fill_workbook_measurements(
     workbook,
     sheet_name: str,
@@ -1930,6 +2341,7 @@ def fill_workbook_measurements(
         regions = existing_series_regions(ws, [series_name]) if series_name else {}
         if series_name in regions:
             region_start, region_end = regions[series_name]
+            clear_measurement_region(ws, region_start, region_end)
             report = [
                 f"Серия {series_name}: запись только в строки {region_start}-{region_end} листа {sheet_name!r}."
             ]
@@ -1943,6 +2355,9 @@ def fill_workbook_measurements(
             )
             report.extend(f"{series_name}: {line}" for line in series_report)
             return report
+        if series_name:
+            rename_series_block_titles(ws, series_name, 1, ws.max_row)
+            clear_measurement_region(ws, 1, ws.max_row)
         return append_measurement_blocks(ws, records, ascii_record, bindings)
 
     ws = workbook[sheet_name]
@@ -1968,6 +2383,7 @@ def fill_workbook_measurements(
 
     for series_name, series_records in series_groups:
         region_start, region_end = regions[series_name]
+        clear_measurement_region(ws, region_start, region_end)
         report.append(f"Серия {series_name}: строки {region_start}-{region_end} листа {sheet_name!r}.")
 
         series_report = append_measurement_blocks(
@@ -2005,6 +2421,7 @@ def fill_workbook_measurements_by_series_folders(
     ]
     for series_name, records in record_groups:
         region_start, region_end = regions[series_name]
+        clear_measurement_region(ws, region_start, region_end)
         report.append(
             f"Серия {series_name}: {len(records)} .rwd, строки {region_start}-{region_end} листа {sheet_name!r}."
         )
@@ -2129,6 +2546,323 @@ def interactive_args() -> argparse.Namespace:
     )
 
 
+def collect_csv_source_files(
+    paths: list[Path],
+    recursive: bool,
+) -> tuple[list[Path], list[Path]]:
+    rwd_files: list[Path] = []
+    ascii_files: list[Path] = []
+    for path in paths:
+        expanded = path.expanduser()
+        if expanded.is_dir():
+            file_iter = expanded.rglob("*") if recursive else expanded.glob("*")
+            for file in file_iter:
+                if not file.is_file():
+                    continue
+                suffix = file.suffix.lower()
+                if suffix == ".rwd":
+                    rwd_files.append(file.resolve())
+                elif suffix in ASCII_SUFFIXES:
+                    ascii_files.append(file.resolve())
+        elif expanded.is_file():
+            suffix = expanded.suffix.lower()
+            if suffix == ".rwd":
+                rwd_files.append(expanded.resolve())
+            elif suffix in ASCII_SUFFIXES:
+                ascii_files.append(expanded.resolve())
+            else:
+                raise RuntimeError(f"CSV-режим принимает только .rwd, ASCII-файлы или папки: {path}")
+        else:
+            visible_path = str(path).replace("\n", "\\n")
+            raise RuntimeError(f"Не найден файл или папка для CSV-экспорта: {visible_path!r}.")
+    return (
+        sorted(set(rwd_files), key=lambda item: str(item).lower()),
+        sorted(set(ascii_files), key=lambda item: str(item).lower()),
+    )
+
+
+def csv_stem_key(path: Path) -> str:
+    stem = path.stem.lower()
+    stem = re.sub(r"_(good|bad)(?=$|_)", "", stem)
+    stem = re.sub(r"_+", "_", stem).strip("_")
+    return stem
+
+
+def csv_common_root(inputs: list[Path], files: list[Path]) -> Path:
+    directories = [path.expanduser().resolve() for path in inputs if path.expanduser().is_dir()]
+    if len(directories) == 1:
+        directory = directories[0]
+        if all(str(file).startswith(str(directory)) for file in files):
+            return directory
+    common = os.path.commonpath([str(file.parent) for file in files])
+    return Path(common)
+
+
+def csv_relative_output_path(file: Path, base_dir: Path, output_dir: Path) -> Path:
+    try:
+        relative = file.relative_to(base_dir)
+    except ValueError:
+        relative = Path(file.name)
+    return output_dir / relative.with_suffix(".csv")
+
+
+def csv_format_value(value: float, raw_values: bool, decimal_comma: bool) -> str:
+    raw_value = raw_excel_value(value)
+    if isinstance(raw_value, str):
+        return raw_value
+    if raw_values:
+        text = f"{raw_value:.9g}"
+    else:
+        text = str(measurement_excel_value(raw_value))
+    return text.replace(".", ",") if decimal_comma else text
+
+
+def csv_record_capacity(
+    record: RwdRecord,
+    ascii_record: AsciiRecord,
+) -> tuple[int, list[CsvChannelBinding]]:
+    bindings = csv_channel_bindings(ascii_record, record)
+    required_span = csv_required_byte_span(ascii_record)
+    for binding in bindings:
+        block = nth_numeric_block(record, binding.block_key, binding.block_occurrence)
+        if block is None:
+            raise RuntimeError(
+                f"Файл {record.path.name}: не найден бинарный блок {binding.block_key} "
+                f"для канала {binding.header!r}."
+            )
+        available_span = block_byte_capacity(record, block)
+        if required_span > available_span:
+            raise RuntimeError(
+                f"канал {binding.header!r} содержит {available_span} байт данных, "
+                f"а ASCII-структура требует {required_span} байт."
+            )
+    return len(ascii_record.rows), bindings
+
+
+def select_ascii_record_for_csv(
+    record: RwdRecord,
+    ascii_records: list[AsciiRecord],
+) -> tuple[AsciiRecord, list[CsvChannelBinding], str]:
+    same_folder = [item for item in ascii_records if item.path.parent.resolve() == record.path.parent.resolve()]
+    candidates = same_folder or ascii_records
+    if not candidates:
+        raise RuntimeError(
+            f"Для файла {record.path.name} не найден ASCII-файл структуры рядом с .rwd."
+        )
+
+    key = csv_stem_key(record.path)
+    exact_matches = [item for item in candidates if csv_stem_key(item.path) == key]
+    checked = exact_matches or candidates
+    viable: list[tuple[int, int, str, AsciiRecord, list[CsvChannelBinding]]] = []
+    errors: list[str] = []
+    for ascii_record in checked:
+        try:
+            capacity, bindings = csv_record_capacity(record, ascii_record)
+        except RuntimeError as error:
+            errors.append(f"{ascii_record.path.name}: {error}")
+            continue
+        if len(ascii_record.rows) <= capacity:
+            exact_rank = 1 if csv_stem_key(ascii_record.path) == key else 0
+            viable.append((exact_rank, len(ascii_record.rows), ascii_record.path.name.lower(), ascii_record, bindings))
+    if not viable and exact_matches:
+        checked = candidates
+        for ascii_record in checked:
+            try:
+                capacity, bindings = csv_record_capacity(record, ascii_record)
+            except RuntimeError as error:
+                errors.append(f"{ascii_record.path.name}: {error}")
+                continue
+            if len(ascii_record.rows) <= capacity:
+                exact_rank = 1 if csv_stem_key(ascii_record.path) == key else 0
+                viable.append((exact_rank, len(ascii_record.rows), ascii_record.path.name.lower(), ascii_record, bindings))
+    if not viable:
+        details = "; ".join(errors[:3])
+        raise RuntimeError(
+            f"Для файла {record.path.name} не удалось подобрать ASCII-структуру "
+            f"под длину бинарных массивов. {details}"
+        )
+    exact_rank, _, _, ascii_record, bindings = max(viable, key=lambda item: (item[0], item[1], item[2]))
+    mode = "по имени файла" if exact_rank else "по максимальной подходящей длине"
+    return ascii_record, bindings, mode
+
+
+def write_measurement_csv(
+    record: RwdRecord,
+    ascii_record: AsciiRecord,
+    bindings: list[CsvChannelBinding],
+    output_path: Path,
+    delimiter: str,
+    raw_values: bool,
+    decimal_comma: bool,
+) -> int:
+    row_count = len(ascii_record.rows)
+    row_segments = ascii_row_segments_for_csv(ascii_record)
+    value_columns: list[list[float]] = []
+    for binding in bindings:
+        block = nth_numeric_block(record, binding.block_key, binding.block_occurrence)
+        if block is None:
+            raise RuntimeError(
+                f"Файл {record.path.name}: не найден бинарный блок {binding.block_key}."
+            )
+        values: list[float] = []
+        for segment in row_segments:
+            values.extend(
+                read_block_float_values(
+                    record,
+                    block,
+                    segment.row_count,
+                    binding.transform,
+                    block.data_offset + segment.byte_offset,
+                )
+            )
+        if len(values) != row_count:
+            raise RuntimeError(
+                f"Файл {record.path.name}: канал {binding.header!r} дал {len(values)} "
+                f"значений вместо {row_count}."
+            )
+        value_columns.append(values)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle, delimiter=delimiter)
+        writer.writerow(ascii_record.headers)
+        for row_index, ascii_row in enumerate(ascii_record.rows):
+            writer.writerow(
+                [ascii_row[0]]
+                + [
+                    csv_format_value(values[row_index], raw_values, decimal_comma)
+                    for values in value_columns
+                ]
+            )
+    return row_count
+
+
+def write_rows_csv(path: Path, rows: list[list[Any]], delimiter: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle, delimiter=delimiter)
+        writer.writerows(rows)
+
+
+def parse_csv_command_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Выгрузить табличные данные HAAKE RheoWin .rwd в CSV без Excel-шаблона."
+    )
+    parser.add_argument("command", choices=["csv"], help=argparse.SUPPRESS)
+    parser.add_argument("inputs", nargs="+", type=Path, help="Один или несколько .rwd/ASCII файлов либо папок.")
+    parser.add_argument("-o", "--output-dir", required=True, type=Path, help="Папка для CSV-файлов.")
+    parser.add_argument("-r", "--recursive", action="store_true", help="Искать файлы во вложенных папках.")
+    parser.add_argument(
+        "--ascii",
+        action="append",
+        default=[],
+        type=Path,
+        help="Явно добавить ASCII-файл структуры. Можно передать несколько раз.",
+    )
+    parser.add_argument(
+        "--delimiter",
+        default=";",
+        help="Разделитель CSV. По умолчанию ';', чтобы Excel на macOS проще открывал таблицы.",
+    )
+    parser.add_argument(
+        "--raw-values",
+        action="store_true",
+        help="Писать float32 как есть, без округления до RheoWin-подобной разрядности.",
+    )
+    parser.add_argument(
+        "--decimal-comma",
+        action="store_true",
+        help="Писать десятичную запятую вместо точки для удобного открытия CSV в Excel.",
+    )
+    return parser.parse_args(argv)
+
+
+def run_csv_export(args: argparse.Namespace) -> int:
+    timer = StepTimer()
+    input_paths = [path.expanduser() for path in args.inputs]
+    rwd_files, ascii_files = collect_csv_source_files(input_paths, args.recursive)
+    explicit_ascii_paths = [path.expanduser().resolve() for path in args.ascii]
+    for path in explicit_ascii_paths:
+        if not path.is_file() or path.suffix.lower() not in ASCII_SUFFIXES:
+            raise RuntimeError(f"Переданный --ascii файл не найден или не является ASCII: {path}")
+    ascii_files = sorted(set(ascii_files + explicit_ascii_paths), key=lambda item: str(item).lower())
+    if not rwd_files:
+        raise RuntimeError("CSV-режим не нашел .rwd файлы для обработки.")
+    if not ascii_files:
+        raise RuntimeError(
+            "CSV-режим не нашел ASCII-файлы структуры. "
+            "Положите .txt/.asc/.csv рядом с .rwd или передайте их через --ascii."
+        )
+    timer.mark("Поиск входных файлов")
+
+    ascii_records = [extract_ascii_record(path) for path in ascii_files]
+    records = [extract_rwd_record(path) for path in rwd_files]
+    timer.mark("Чтение ASCII и .rwd")
+
+    output_dir = args.output_dir.expanduser().resolve()
+    base_dir = csv_common_root(input_paths, rwd_files)
+    summary_rows: list[list[Any]] = [["rwd_file", "ascii_file", "output_csv", "rows", "status", "note"]]
+    mapping_rows: list[list[Any]] = [
+        ["rwd_file", "ascii_file", "header", "code_1", "code_2", "dtype", "occurrence", "transform"]
+    ]
+    metadata_header = ["file_name", *metadata_fields(records[0]).keys()]
+    metadata_rows: list[list[Any]] = [metadata_header]
+    failures = 0
+
+    for record in records:
+        metadata = metadata_fields(record)
+        metadata_rows.append([record.path.name] + [metadata.get(field, "") for field in metadata_header[1:]])
+        try:
+            ascii_record, bindings, match_mode = select_ascii_record_for_csv(record, ascii_records)
+            output_path = csv_relative_output_path(record.path, base_dir, output_dir)
+            row_count = write_measurement_csv(
+                record,
+                ascii_record,
+                bindings,
+                output_path,
+                args.delimiter,
+                args.raw_values,
+                args.decimal_comma,
+            )
+            summary_rows.append(
+                [str(record.path), str(ascii_record.path), str(output_path), row_count, "ok", match_mode]
+            )
+            for binding in bindings:
+                mapping_rows.append(
+                    [
+                        str(record.path),
+                        str(ascii_record.path),
+                        binding.header,
+                        binding.block_key[0],
+                        binding.block_key[1],
+                        binding.block_key[2],
+                        binding.block_occurrence,
+                        binding.transform,
+                    ]
+                )
+        except RuntimeError as error:
+            failures += 1
+            summary_rows.append([str(record.path), "", "", 0, "error", str(error)])
+
+    write_rows_csv(output_dir / "_summary.csv", summary_rows, args.delimiter)
+    write_rows_csv(output_dir / "_metadata.csv", metadata_rows, args.delimiter)
+    write_rows_csv(output_dir / "_mapping.csv", mapping_rows, args.delimiter)
+    timer.mark("Запись CSV")
+
+    print(f"Найдено .rwd файлов: {len(rwd_files)}")
+    print(f"Найдено ASCII-файлов структуры: {len(ascii_files)}")
+    print(f"CSV-папка: {output_dir}")
+    print(f"Успешно выгружено .rwd: {len(rwd_files) - failures}")
+    if failures:
+        print(f"Ошибок выгрузки: {failures}")
+        print(f"Подробности записаны в: {output_dir / '_summary.csv'}")
+    print("Время выполнения:")
+    for label, seconds in timer.steps:
+        print(f"  - {label}: {format_elapsed(seconds)}")
+    print(f"  - Итого: {format_elapsed(timer.total)}")
+    return 1 if failures else 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Заполнить Excel-шаблон фактическими данными из HAAKE RheoWin .rwd по структуре ASCII."
@@ -2237,6 +2971,9 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:] if argv is None else argv
         if not argv:
             args = interactive_args()
+        elif argv[0].lower() == "csv":
+            args = parse_csv_command_args(argv)
+            return run_csv_export(args)
         elif argv[0].lower() == "series":
             args = parse_series_command_args(argv)
         else:
@@ -2275,6 +3012,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             fill_report = fill_workbook_measurements(workbook, args.sheet, records, ascii_record, bindings)
+        fill_report = record_identity_notes(records) + fill_report
         if args.include_ascii_data:
             fill_report.extend(
                 fill_ascii_data_into_workbook(
@@ -2296,6 +3034,10 @@ def main(argv: list[str] | None = None) -> int:
                     getattr(args, "target_series", None),
                 )
             )
+        output_source_count = rebuild_output_data(workbook, args.sheet, points=20)
+        fill_report.append(
+            f"Лист output_data пересобран по фактическим данным: {output_source_count} частотных серий."
+        )
         duplicate_groups = validate_no_input_duplicates(
             workbook,
             args.sheet,
