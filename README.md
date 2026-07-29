@@ -1,48 +1,17 @@
 # Парсер HAAKE RheoWin `.rwd`
 
-Проект переносит измерения из бинарных файлов RheoWin в подготовленный
-Excel-шаблон и строит графики через `matplotlib`.
+Локальный инструмент для переноса измерений из бинарных файлов RheoWin `.rwd`
+в Excel и построения графиков через `matplotlib`.
 
-Рабочий процесс состоит из двух команд:
+Проект работает в два шага:
 
-1. `haake_cli.py` читает `.rwd`, заполняет `input_data` и пересобирает
-   `output_data`.
-2. `haake_plot.py` читает `output_data` и сохраняет графики в PNG, SVG или PDF.
+1. `haake_cli.py` читает `.rwd`, заполняет `input_data` и формирует
+   `output_data` с первыми 20 точками каждой серии.
+2. `haake_plot.py` строит графики из `output_data`.
 
-ASCII-экспорт RheoWin нужен как описание структуры колонок. Измерительные
-значения берутся из `.rwd`; ASCII не обязан относиться к тому же эксперименту,
-если состав и порядок колонок совпадают.
-
-ASCII можно получить в RheoWin Data Manager экспортом готового `.rwd` или
-добавить соответствующий блок в рабочий скрипт Job Manager.
-
-## Структура проекта
-
-```text
-haake_parser/
-├── haake_cli.py
-├── haake_plot.py
-├── haake_rheo/
-│   ├── __init__.py
-│   ├── excel_import.py
-│   └── plot.py
-├── docs/
-│   └── parser_usage_sequence.puml
-├── input/
-│   ├── may_proj_template_first20_clean.xlsx
-│   ├── D_series_report_template_first20_clean.xlsx
-│   ├── D_series_template_first20_clean.xlsx
-│   └── SCTNA_60_PyrO_40_Katal68_3_template_first20_clean.xlsx
-├── tests/
-│   ├── test_excel_import.py
-│   └── test_plot.py
-├── output/
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
-Папки с исходными экспериментами и содержимое `output/` не хранятся в Git.
+ASCII-файл RheoWin нужен для описания колонок и сегментов. Числовые значения
+по умолчанию всегда берутся из `.rwd`. Один ASCII можно использовать для
+нескольких `.rwd`, если в них одинаковая структура измерений.
 
 ## Установка
 
@@ -51,208 +20,162 @@ cd /Users/artem/Desktop/Output/iam_ras/haake_parser
 python3 -m pip install -r requirements.txt
 ```
 
-## Июльский проект: полный запуск
+## Быстрый запуск
 
-### 1. Заполнить Excel
+Самый удобный режим — интерактивный. Файлы и папки можно перетаскивать в
+терминал мышью.
 
 ```bash
 cd /Users/artem/Desktop/Output/iam_ras/haake_parser
-
-python3 haake_cli.py \
-  "/Users/artem/Desktop/Output/iam_ras/haake_parser/input/may_proj_template_first20_clean.xlsx" \
-  "/Users/artem/Desktop/Output/iam_ras/haake_parser/input/07_july_proj/SCTNA_59_tio2_41_3000nm_catal68_6/0v/SCTNA_59_tio2_41_3000nm_catal68_6_freq=from_01_to_100hz_U=0v_30_points_ver1_good.txt" \
-  "/Users/artem/Desktop/Output/iam_ras/haake_parser/input/07_july_proj" \
-  --recursive \
-  --sheet "input_data" \
-  -o "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/07_july_proj.xlsx"
+python3 haake_cli.py
 ```
 
-В этой команде:
+Программа последовательно спросит:
 
-- шаблон задаёт расположение листов и таблиц;
-- ASCII задаёт состав бинарных каналов;
-- `07_july_proj` является корневой папкой с `.rwd`;
-- `--recursive` включает поиск во всех вложенных папках;
-- результат сохраняется в `output/07_july_proj.xlsx`.
+1. Excel-шаблон `.xlsx`.
+2. ASCII-файл RheoWin `.txt`, `.asc` или `.csv`.
+3. Один или несколько `.rwd` либо папку с `.rwd`.
+4. Нужно ли искать `.rwd` во вложенных папках.
+5. Лист Excel для записи, обычно `input_data`.
+6. Путь к новой итоговой книге.
+7. Нужен ли технический лист `raw_values`.
 
-Файлы и папки можно перетаскивать в терминал. Лучше сохранять результат под
-новым именем и не держать эту книгу открытой в Excel во время записи.
-
-### 2. Построить графики
+После создания книги постройте графики:
 
 ```bash
-python3 haake_plot.py \
-  "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/07_july_proj.xlsx" \
-  --sheet "output_data" \
-  -o "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/plots_07_july_proj" \
-  --points 20 \
-  --poly-order 3 \
-  --legend-columns 1 \
-  --formats png \
-  --split-by-series
+python3 haake_plot.py
 ```
 
-При `--split-by-series` каждая смесь получает отдельную папку графиков. На
-одной картинке остаются только напряжения одной смеси.
+По умолчанию скрипт предлагает использовать лист `output_data`.
 
-## Правила идентификации данных
+## Запуск с аргументами
 
-### Имя `.rwd` имеет приоритет
-
-Состав, напряжение и заявленная частота определяются по имени `.rwd`.
-
-Например:
+Порядок позиционных аргументов у импортера всегда один:
 
 ```text
-SCTNA_59_tio2_41_3000nm_catal68_6_freq=from_01_to_100hz_U=2000v_30_points_ver1_good.rwd
+haake_cli.py Excel-шаблон ASCII-структура .rwd-или-папка [другие-.rwd-или-папки]
 ```
 
-относится к смеси `SCTNA_59_tio2_41_3000nm_catal68_6` и напряжению `2000 В`.
+Обязательные флаги:
 
-Внутренние служебные пути RheoWin могут сохранять старое имя эксперимента
-после ручного переименования файла. Если внутренний путь не совпадает с именем
-`.rwd`, парсер выводит предупреждение, но использует имя файла.
+```text
+--sheet input_data
+-o итоговая_книга.xlsx
+```
 
-### Частоты приводятся к общей сетке
+Для поиска во вложенных папках добавьте `--recursive`.
 
-Для отчётов используется стандартный набор:
+Полный список параметров:
+
+```bash
+python3 haake_cli.py --help
+python3 haake_plot.py --help
+```
+
+## Правила обработки
+
+### Идентификация эксперимента
+
+Состав, напряжение и заявленный диапазон частот определяются по имени
+переданного `.rwd`. Внутренние пути RheoWin могут сохранять старое имя после
+переименования файла; при расхождении программа выводит предупреждение, но не
+подменяет значение из имени файла.
+
+### Частоты
+
+Данные приводятся к общей сетке отчёта:
 
 ```text
 0.1, 0.5, 1, 5, 10, 20, 30, 50, 75, 100 Гц
 ```
 
-Близкие значения канала, например `30.66` и `51.1 Гц`, записываются в блоки
-`30` и `50 Гц`. Сам канал частоты всё равно проверяется при разборе `.rwd`.
+Близкие измеренные значения автоматически относятся к соответствующему
+стандартному блоку. Например, `30.66` Гц записывается как `30` Гц, а `51.1`
+Гц — как `50` Гц.
 
-### Измерения округляются как в ASCII RheoWin
+### Дубликаты и неполные сегменты
 
-По умолчанию числа приводятся к разрядности, близкой к официальному
-ASCII-экспорту. Это устраняет хвосты `float32` вида `319462.0313`, когда
-RheoWin показывает `319500`.
+Перед сохранением парсер проверяет `input_data` на одинаковые числовые блоки.
+Если один набор точек оказался в разных частотах или секциях, импорт
+останавливается. Флаг `--allow-duplicates` предназначен только для отладки.
 
-## Что делает парсер
+Сегмент, в котором недостаточно физически валидных строк, не записывается.
+Сообщение в консоли указывает имя файла, частоту и число найденных строк.
 
-1. Проверяет пути к шаблону, ASCII и `.rwd`.
-2. Читает заголовки ASCII и строит карту бинарных каналов.
-3. Находит одиночные и сборные `.rwd`.
-4. Группирует данные по смеси и напряжению из имени файла.
-5. Сопоставляет частотные сегменты и приводит частоты к общей сетке.
-6. Записывает измерения на `input_data`.
-7. Проверяет заполненные блоки на дубли.
-8. Пересобирает `output_data` для первых 20 точек.
-9. Обновляет `instrument_metadata`.
-10. Сохраняет новую Excel-книгу и печатает время выполнения.
+### ASCII как источник значений
 
-Лист `freq_diagrams` парсер не заполняет картинками. Графики сохраняются
-отдельным скриптом.
+Обычный ASCII-файл описывает структуру и не переносится в итоговую книгу.
+Чтобы намеренно взять измерения из ASCII, используйте
+`--include-ascii-data` или передайте отдельный файл через `--data-ascii`.
 
-## Интерактивный запуск
+## Листы Excel
 
-Парсер можно запустить без аргументов:
+- `input_data` — исходные извлечённые значения, до 30 точек в подблоке.
+- `output_data` — первые 20 точек для построения графиков.
+- `instrument_metadata` — метаданные измерительного прибора и файла.
+- `freq_diagrams` — место в шаблоне для итоговых изображений; парсер не
+  вставляет туда графики автоматически.
+- `raw_values` — технический лист, добавляется только с
+  `--include-diagnostics`.
 
-```bash
-python3 haake_cli.py
+## Графики
+
+`haake_plot.py` строит логарифмические диаграммы для `G'`, `G''`, `|eta*|` и
+`tan delta` относительно `gamma`.
+
+Полезные параметры:
+
+```text
+--points 20              первые точки каждого подблока
+--poly-order 3           степень сглаживающего полинома
+--no-fit                 только точки, без сглаживания
+--legend-columns 1       число столбцов легенды
+--split-by-series        отдельные графики для каждой серии
+--series                 отобрать конкретные серии
+--formats png svg pdf    форматы сохранения
+--frequencies            отобрать частоты
 ```
 
-Файлы и папки можно перетаскивать в терминал. Для обработки вложенных папок
-нужно ответить `y` на вопрос о рекурсивном поиске.
+Полином строится в логарифмических координатах и служит только визуальной
+направляющей. Если аппроксимация становится неустойчивой, программа понижает
+её порядок; если устойчивую кривую получить нельзя, показывает только точки.
+Для количественного анализа используйте исходные точки, а не линию сглаживания.
 
-## D31, D33 и D35
+## Выгрузка CSV без Excel-шаблона
 
-Серии можно последовательно записать в один отчёт:
+Если эксперимент не подходит к существующему шаблону, можно извлечь таблицы в
+CSV без построения Excel-книги:
 
-```bash
-cd /Users/artem/Desktop/Output/iam_ras/haake_parser
-
-TEMPLATE="/Users/artem/Desktop/Output/iam_ras/haake_parser/input/D_series_report_template_first20_clean.xlsx"
-ASCII="/Users/artem/Desktop/Output/iam_ras/haake_parser/input/06_june_proj/d31/2000v/D31_freq=20hz_U=2000v_30_points_ver1.txt"
-INPUT_ROOT="/Users/artem/Desktop/Output/iam_ras/haake_parser/input/06_june_proj"
-OUTPUT="/Users/artem/Desktop/Output/iam_ras/haake_parser/output/D31_D33_D35_06_june.xlsx"
-
-python3 haake_cli.py series d31 \
-  --template "$TEMPLATE" \
-  --ascii "$ASCII" \
-  --input-root "$INPUT_ROOT" \
-  -o "$OUTPUT"
-
-python3 haake_cli.py series d33 \
-  --template "$OUTPUT" \
-  --ascii "$ASCII" \
-  --input-root "$INPUT_ROOT" \
-  -o "$OUTPUT"
-
-python3 haake_cli.py series d35 \
-  --template "$OUTPUT" \
-  --ascii "$ASCII" \
-  --input-root "$INPUT_ROOT" \
-  -o "$OUTPUT"
+```text
+haake_cli.py csv папка-или-файлы --recursive -o папка_для_csv
 ```
 
-Графики:
+В папке результата создаются файлы измерений, `_summary.csv`, `_metadata.csv`
+и `_mapping.csv`. Флаг `--decimal-comma` записывает числа с десятичной запятой,
+а `--raw-values` отключает округление до разрядности RheoWin.
 
-```bash
-python3 haake_plot.py \
-  "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/D31_D33_D35_06_june.xlsx" \
-  --sheet "output_data" \
-  -o "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/plots_D31_D33_D35_06_june" \
-  --points 20 \
-  --poly-order 3 \
-  --legend-columns 3 \
-  --formats png \
-  --split-by-series \
-  --series D31 D33 D35
+## Структура проекта
+
+```text
+haake_parser/
+├── haake_cli.py                 точка входа импортера Excel и CSV
+├── haake_plot.py                точка входа построения графиков
+├── haake_rheo/
+│   ├── excel_import.py          ASCII, RWD, Excel, CSV и валидация
+│   └── plot.py                  чтение output_data и matplotlib-графики
+├── docs/
+│   └── parser_usage_sequence.puml
+├── input/                       шаблоны и локальные исходные данные
+├── output/                      локальные результаты, не добавляются в Git
+├── tests/
+│   ├── test_excel_import.py
+│   └── test_plot.py
+├── requirements.txt
+└── README.md
 ```
 
-## CSV без Excel-шаблона
-
-Для экспериментов с другой структурой можно выгрузить каждый `.rwd` в CSV:
-
-```bash
-python3 haake_cli.py csv \
-  "/Users/artem/Desktop/Output/iam_ras/data/TiO2_5V_PMS400_95V" \
-  --recursive \
-  -o "/Users/artem/Desktop/Output/iam_ras/haake_parser/output/TiO2_5V_PMS400_95V_csv" \
-  --decimal-comma
-```
-
-Кроме таблиц измерений будут созданы:
-
-- `_summary.csv` — результат обработки каждого `.rwd`;
-- `_metadata.csv` — метаданные;
-- `_mapping.csv` — использованные бинарные каналы.
-
-## Настройки графиков
-
-Количество точек:
-
-```bash
---points 20
-```
-
-Степень полинома в координатах `log10(gamma)` и `log10(y)`:
-
-```bash
---poly-order 3
-```
-
-Если полином третьего порядка неустойчив, скрипт автоматически пробует более
-низкую степень. Отключить сглаживание полностью:
-
-```bash
---no-fit
-```
-
-Построить только выбранные показатели:
-
-```bash
---metrics g_prime g_double_prime eta tan_delta
-```
-
-Построить только выбранные частоты:
-
-```bash
---frequencies 0.1 0.5 1 5
-```
+ASCII можно получить в RheoWin Data Manager экспортом готового `.rwd` или
+добавить соответствующий блок в рабочий скрипт Job Manager.
 
 ## Проверка перед коммитом
 
@@ -260,5 +183,6 @@ python3 haake_cli.py csv \
 cd /Users/artem/Desktop/Output/iam_ras/haake_parser
 python3 -m unittest discover -s tests -v
 python3 -m py_compile haake_cli.py haake_plot.py haake_rheo/*.py
+git diff --check
 git status --short
 ```
