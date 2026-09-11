@@ -223,6 +223,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Построить matplotlib-графики из листа output_data Excel-книги HAAKE."
     )
     parser.add_argument("workbook", type=Path, help="Excel-книга .xlsx после запуска haake_cli.py.")
+    parser.add_argument("--language", choices=["ru", "en"], default=None,
+                        help="Язык подписей графика; без флага сохраняется прежний стиль.")
     parser.add_argument("--sheet", default="output_data", help="Лист с подготовленными данными.")
     parser.add_argument(
         "-o",
@@ -929,6 +931,7 @@ def plot_metric(
     draw_fit: bool,
     legend_columns: int,
     series_name: str | None = None,
+    language: str | None = None,
 ) -> list[Path]:
     metric_info = METRICS[metric]
     fig, ax = plt.subplots(figsize=(7.2, 8.6), dpi=dpi)
@@ -973,7 +976,17 @@ def plot_metric(
     ax.set_box_aspect(1)
     ax.set_xlabel(f"Gamma {frequency_label.replace(' ', '')}", fontsize=13, fontweight="bold")
     ax.set_ylabel(f"{metric_info['ylabel']} {frequency_label.replace(' ', '')}", fontsize=13, fontweight="bold")
+    if language is not None:
+        unit = "Па" if language == "ru" else "Pa"
+        labels = {"g_prime": f"G′, {unit}", "g_double_prime": f"G″, {unit}",
+                  "eta": "|η*|, Па·с" if language == "ru" else "|η*|, Pa·s", "tan_delta": "tan δ"}
+        ax.set_xlabel("Деформация γ" if language == "ru" else "Strain γ", fontsize=13, fontweight="bold")
+        ax.set_ylabel(labels[metric], fontsize=13, fontweight="bold")
     title_parts = [metric_info["title"]]
+    if language is not None:
+        title_parts = [{"g_prime": "G′(γ)", "g_double_prime": "G″(γ)",
+                        "eta": "|η*|(γ)", "tan_delta": "tan δ(γ)"}[metric]]
+        frequency_label = f"{frequency_hz:g} " + ("Гц" if language == "ru" else "Hz")
     if series_name:
         title_parts.append(series_name)
     title_parts.append(frequency_label)
@@ -1073,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
                         not args.no_fit,
                         args.legend_columns,
                         visible_series_name,
+                        getattr(args, "language", None),
                     )
                 )
 

@@ -8,6 +8,7 @@ from haake_rheo.excel_import import (
     RwdRecord,
     clear_measurement_region,
     embedded_record_voltage,
+    experiment_series_name_from_path,
     format_frequency_heading,
     normalize_collected_rwd_files,
     record_identity_notes,
@@ -18,6 +19,17 @@ from haake_rheo.excel_import import (
 
 
 class BatchFileSelectionTests(TestCase):
+    def test_uses_file_identity_when_voltage_folder_is_inside_project_root(self) -> None:
+        file = Path(
+            "/tmp/TiO2_3%_test/2000v/"
+            "SCTNA_59_tio2_41_30micron_catal68_3_freq=from_01_to_100hz_U=2000v_20_points.rwd"
+        )
+
+        self.assertEqual(
+            experiment_series_name_from_path(file),
+            "SCTNA_59_tio2_41_30micron_catal68_3",
+        )
+
     def test_keeps_complementary_batch_ranges(self) -> None:
         with TemporaryDirectory() as directory:
             voltage_dir = Path(directory) / "sample" / "500v"
@@ -88,6 +100,18 @@ class WorkbookPreparationTests(TestCase):
         self.assertEqual(self.input_ws.cell(2, 2).value, "Частота 0,1 Гц")
         self.assertEqual(self.input_ws.cell(3, 4).value, "G' in Pa")
         self.assertIsNone(self.input_ws.cell(4, 4).value)
+
+    def test_clearing_does_not_remove_following_voltage_titles(self) -> None:
+        self.input_ws.cell(25, 2, "sample_U=500v_30_points")
+        self.input_ws.cell(26, 2, "Частота 0,1 Гц")
+        for offset, header in enumerate(["t_seg in s", "Tau in Pa", "G' in Pa", 'G" in Pa', "|eta*| in Pas", "gamma"]):
+            self.input_ws.cell(27, 2 + offset, header)
+
+        clear_measurement_region(self.input_ws, 1, 30)
+
+        self.assertEqual(self.input_ws.cell(25, 2).value, "sample_U=500v_30_points")
+        self.assertEqual(self.input_ws.cell(26, 2).value, "Частота 0,1 Гц")
+        self.assertEqual(self.input_ws.cell(27, 4).value, "G' in Pa")
 
     def test_rebuilds_output_data_from_actual_series(self) -> None:
         source_count = rebuild_output_data(self.workbook, "input_data", points=20)

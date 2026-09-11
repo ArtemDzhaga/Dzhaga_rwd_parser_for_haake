@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter, range_boundaries
 
@@ -881,7 +882,19 @@ def extract_signed_rows(
 
 
 def is_real_number(value: str | float) -> bool:
-    return isinstance(value, (int, float)) and math.isfinite(float(value))
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value))
+    if isinstance(value, str):
+        text = value.strip().replace(" ", "").replace(",", ".")
+        if not text:
+            return False
+        try:
+            return math.isfinite(float(text))
+        except ValueError:
+            return False
+    return False
 
 
 def valid_measurement_row_count(rows: list[list[str | float]]) -> int:
@@ -909,6 +922,14 @@ def measurement_quality_note(record: RwdRecord, frequency: float, valid_count: i
         f"{record.path.name}: сегмент {frequency:g} Гц пропущен: "
         f"найдено только {valid_count} физически валидных строк из {expected_count}. "
         "Похоже, рабочие бинарные каналы файла пустые или повреждены."
+    )
+
+
+def partial_measurement_note(record: RwdRecord, frequency: float, valid_count: int, expected_count: int) -> str:
+    return (
+        f"{record.path.name}: сегмент {frequency:g} Гц записан частично: "
+        f"{valid_count} физически валидных строк из {expected_count}; "
+        "недоступные исходные значения оставлены как NaN."
     )
 
 
@@ -1065,9 +1086,12 @@ def voltage_folder_hint(path: Path) -> str | None:
 
 
 def experiment_series_name_from_path(path: Path, identity: ExperimentIdentity | None = None) -> str:
+    identity_name = experiment_series_name_from_identity(identity or parse_experiment_identity(path))
     if re.fullmatch(r"\d+v", path.parent.name, re.I):
-        return path.parent.parent.name
-    return experiment_series_name_from_identity(identity or parse_experiment_identity(path))
+        parent_name = path.parent.parent.name
+        if parent_name.lower() == identity_name.lower():
+            return parent_name
+    return identity_name
 
 
 def rwd_preference_key(path: Path) -> tuple[int, int, str]:
@@ -1543,7 +1567,7 @@ def fill_template_measurement_blocks(
                 record_segment_index,
             )
             valid_count = valid_measurement_row_count(rows)
-            if valid_count < minimum_segment_points(matched_row_count):
+            if valid_count == 0:
                 frequency_notes.append(
                     measurement_quality_note(
                         record,
@@ -1553,6 +1577,15 @@ def fill_template_measurement_blocks(
                     )
                 )
                 continue
+            if valid_count < matched_row_count:
+                frequency_notes.append(
+                    partial_measurement_note(
+                        record,
+                        segment.frequency_sort_key,
+                        valid_count,
+                        matched_row_count,
+                    )
+                )
 
             seen.add(duplicate_key)
             for row_offset, values in enumerate(rows, start=3):
@@ -1828,9 +1861,11 @@ def append_measurement_blocks(
                 frequency_notes.append(f"{frequency:g} Гц: {frequency_note}")
             rows = extract_signed_rows(record, row_count, selected_bindings, start_index, segment_index)
             valid_count = valid_measurement_row_count(rows)
-            if valid_count < minimum_segment_points(row_count):
+            if valid_count == 0:
                 frequency_notes.append(measurement_quality_note(record, frequency, valid_count, row_count))
                 continue
+            if valid_count < row_count:
+                frequency_notes.append(partial_measurement_note(record, frequency, valid_count, row_count))
 
             ws.cell(block_start_row + 1, value_start_column, frequency_label)
             for column_offset, (display_header, _) in enumerate(selected_bindings):
@@ -2128,11 +2163,16 @@ def existing_series_regions(ws, series_names: list[str]) -> dict[str, tuple[int,
 
 
 def clear_measurement_region(ws, min_row: int, max_row: int) -> None:
-    for block_row in template_voltage_rows(ws, min_row, max_row).values():
+    block_rows = sorted(template_voltage_rows(ws, min_row, max_row).values())
+    for index, block_row in enumerate(block_rows):
+        next_block_row = block_rows[index + 1] if index + 1 < len(block_rows) else max_row + 1
+        data_end_row = min(block_row + 33, next_block_row, max_row + 1)
         for value_column in template_frequency_columns(ws, block_row).values():
-            for row in range(block_row + 3, min(block_row + 33, max_row + 1)):
+            for row in range(block_row + 3, data_end_row):
                 for column in range(value_column - 1, value_column + 6):
-                    ws.cell(row, column).value = None
+                    cell = ws.cell(row, column)
+                    if not isinstance(cell, MergedCell):
+                        cell.value = None
 
 
 def output_formula(sheet_name: str, coordinate: str) -> str:
@@ -2686,15 +2726,12 @@ def select_ascii_record_for_csv(
     return ascii_record, bindings, mode
 
 
-def write_measurement_csv(
+def measurement_rows(
     record: RwdRecord,
     ascii_record: AsciiRecord,
     bindings: list[CsvChannelBinding],
-    output_path: Path,
-    delimiter: str,
-    raw_values: bool,
-    decimal_comma: bool,
-) -> int:
+) -> list[list[Any]]:
+    """Read labeled rows directly from RWD without text-format rounding."""
     row_count = len(ascii_record.rows)
     row_segments = ascii_row_segments_for_csv(ascii_record)
     value_columns: list[list[float]] = []
@@ -2722,19 +2759,35 @@ def write_measurement_csv(
             )
         value_columns.append(values)
 
+    return [
+        [ascii_row[0]] + [values[row_index] for values in value_columns]
+        for row_index, ascii_row in enumerate(ascii_record.rows)
+    ]
+
+
+def write_measurement_csv(
+    record: RwdRecord,
+    ascii_record: AsciiRecord,
+    bindings: list[CsvChannelBinding],
+    output_path: Path,
+    delimiter: str,
+    raw_values: bool,
+    decimal_comma: bool,
+) -> int:
+    rows = measurement_rows(record, ascii_record, bindings)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle, delimiter=delimiter)
         writer.writerow(ascii_record.headers)
-        for row_index, ascii_row in enumerate(ascii_record.rows):
+        for row in rows:
             writer.writerow(
-                [ascii_row[0]]
+                [row[0]]
                 + [
-                    csv_format_value(values[row_index], raw_values, decimal_comma)
-                    for values in value_columns
+                    csv_format_value(value, raw_values, decimal_comma)
+                    for value in row[1:]
                 ]
             )
-    return row_count
+    return len(rows)
 
 
 def write_rows_csv(path: Path, rows: list[list[Any]], delimiter: str) -> None:
